@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package analyzer.v1;
+
+option go_package = "photo-analysis/gen/analyzer/v1;analyzerv1";
+
+// Сервис анализа изображений («внешняя зависимость»).
+// Worker передаёт ссылку на объект в MinIO, analyzer сам скачивает файл.
+service Analyzer {
+  rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
+}
+
+message AnalyzeRequest {
+  string photo_id = 1;
+  string bucket = 2;
+  string object_key = 3;
+}
+
+message AnalyzeResponse {
+  double blur_score = 1;          // дисперсия лапласиана
+  bool is_blurry = 2;
+  int32 faces_count = 3;
+  int32 eyes_closed_count = 4;
+  double mean_brightness = 5;     // 0–255
+  bool is_underexposed = 6;
+  bool is_overexposed = 7;
+  uint64 phash = 8;               // 64-битный перцептивный хеш
+  int32 width = 9;
+  int32 height = 10;
+  string analyzer_version = 11;
+}

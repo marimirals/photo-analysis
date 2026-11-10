@@ -1,0 +1,256 @@
+openapi: 3.0.3
+info:
+  title: Photo Analysis API
+  version: 0.1.0
+  description: |
+    Сервис анализа фотографий для облачного хранилища.
+    Загрузка фото → сохранение в объектное хранилище → задача в Kafka →
+    асинхронный анализ (смазанность, лица, дубликаты, неудачные кадры) → результат через API.
+
+    Пользователь передаётся заголовком `X-User-ID` (упрощение вместо авторизации).
+servers:
+  - url: http://localhost:8080/api/v1
+
+tags:
+  - name: photos
+  - name: system
+
+paths:
+  /photos:
+    post:
+      tags: [photos]
+      summary: Загрузить фотографию
+      parameters:
+        - $ref: '#/components/parameters/UserID'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: JPEG, PNG или WebP, не больше 20 МБ
+      responses:
+        '202':
+          description: Фото принято, анализ поставлен в очередь
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Photo' }
+        '400': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+    get:
+      tags: [photos]
+      summary: Список фотографий пользователя с фильтрами
+      parameters:
+        - $ref: '#/components/parameters/UserID'
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/PhotoStatus' }
+        - name: blurry
+          in: query
+          schema: { type: boolean }
+        - name: bad_shot
+          in: query
+          schema: { type: boolean }
+        - name: duplicates
+          in: query
+          description: true — только фото, у которых найден дубликат
+          schema: { type: boolean }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Список
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/PhotoWithAnalysis' }
+                  total: { type: integer }
+
+  /photos/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PhotoID'
+      - $ref: '#/components/parameters/UserID'
+    get:
+      tags: [photos]
+      summary: Метаданные и статус фотографии
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Photo' }
+        '404': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [photos]
+      summary: Удалить фотографию
+      responses:
+        '204': { description: Удалено }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /photos/{id}/file:
+    parameters:
+      - $ref: '#/components/parameters/PhotoID'
+      - $ref: '#/components/parameters/UserID'
+    get:
+      tags: [photos]
+      summary: Скачать исходный файл
+      responses:
+        '200':
+          description: Файл изображения
+          content:
+            image/*:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /photos/{id}/analysis:
+    parameters:
+      - $ref: '#/components/parameters/PhotoID'
+      - $ref: '#/components/parameters/UserID'
+    get:
+      tags: [photos]
+      summary: Результат анализа
+      description: Пока статус pending или processing, возвращается 202 без результата.
+      responses:
+        '200':
+          description: Анализ готов
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Analysis' }
+        '202':
+          description: Анализ ещё не готов
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Photo' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /healthz:
+    servers: [{ url: http://localhost:8080 }]
+    get:
+      tags: [system]
+      summary: Liveness — процесс жив
+      responses:
+        '200': { description: OK }
+  /readyz:
+    servers: [{ url: http://localhost:8080 }]
+    get:
+      tags: [system]
+      summary: Readiness — есть связь с Postgres, MinIO и Kafka
+      responses:
+        '200': { description: Готов }
+        '503': { description: Не готов }
+  /metrics:
+    servers: [{ url: http://localhost:8080 }]
+    get:
+      tags: [system]
+      summary: Метрики Prometheus
+      responses:
+        '200':
+          description: text/plain в формате Prometheus
+
+components:
+  parameters:
+    UserID:
+      name: X-User-ID
+      in: header
+      required: true
+      schema: { type: string, example: user-1 }
+    PhotoID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  schemas:
+    PhotoStatus:
+      type: string
+      enum: [pending, processing, done, failed]
+
+    Photo:
+      type: object
+      required: [id, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        filename: { type: string, example: IMG_0042.jpg }
+        content_type: { type: string, example: image/jpeg }
+        size_bytes: { type: integer, example: 2483120 }
+        width: { type: integer, nullable: true }
+        height: { type: integer, nullable: true }
+        status: { $ref: '#/components/schemas/PhotoStatus' }
+        error: { type: string, nullable: true, description: Причина, если status = failed }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Analysis:
+      type: object
+      properties:
+        photo_id: { type: string, format: uuid }
+        blur:
+          type: object
+          properties:
+            score: { type: number, description: Дисперсия лапласиана; меньше — сильнее размыто, example: 42.7 }
+            is_blurry: { type: boolean }
+        faces:
+          type: object
+          properties:
+            count: { type: integer, example: 3 }
+            eyes_closed_count: { type: integer, example: 1 }
+        exposure:
+          type: object
+          properties:
+            mean_brightness: { type: number, description: 0–255 }
+            is_underexposed: { type: boolean }
+            is_overexposed: { type: boolean }
+        duplicate:
+          type: object
+          properties:
+            phash: { type: string, description: 64-битный перцептивный хеш, hex, example: 'c3a1f0e0b0989c8e' }
+            duplicate_of:
+              type: array
+              items: { type: string, format: uuid }
+        is_bad_shot:
+          type: boolean
+          description: Смазано, или пересвет/недосвет, или у кого-то закрыты глаза
+        bad_shot_reasons:
+          type: array
+          items:
+            type: string
+            enum: [blurry, eyes_closed, underexposed, overexposed]
+        analyzer_version: { type: string, example: analyzer-0.1.0 }
+        analyzed_at: { type: string, format: date-time }
+
+    PhotoWithAnalysis:
+      allOf:
+        - $ref: '#/components/schemas/Photo'
+        - type: object
+          properties:
+            analysis:
+              allOf: [{ $ref: '#/components/schemas/Analysis' }]
+              nullable: true
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, example: unsupported content type }
+        request_id: { type: string }
+
+  responses:
+    Error:
+      description: Ошибка
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
