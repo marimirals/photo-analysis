@@ -1,0 +1,11 @@
+{
+  "identities": [
+    {
+      "name": "photo-service",
+      "credentials": [
+        { "accessKey": "photo", "secretKey": "photo12345" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
