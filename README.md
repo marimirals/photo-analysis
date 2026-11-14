@@ -107,6 +107,16 @@ curl.exe http://localhost:8080/readyz
 
 `X-User-ID` — это вместо логина: просто имя пользователя в заголовке. Чужие фото по id не видны.
 
+### Посмотреть, что задача ушла в Kafka
+
+После загрузки фото api-service в течение полсекунды отправляет задачу в Kafka. В его логе появится строка `outbox events sent`. Посмотреть сами сообщения:
+
+```powershell
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic photos.uploaded --from-beginning --property print.key=true
+```
+
+Выход — Ctrl+C. Если Kafka выключить (`docker compose stop kafka`), загрузка фото всё равно работает: задачи копятся в таблице `outbox` и уходят, когда Kafka вернётся.
+
 ## Где что лежит
 
 | Путь | Что там |
@@ -114,7 +124,7 @@ curl.exe http://localhost:8080/readyz
 | `api/openapi.yaml` | Описание REST API: какие запросы, что отвечают |
 | `proto/analyzer/v1/analyzer.proto` | Как worker разговаривает с analyzer (gRPC) |
 | `cmd/api/` | Запуск api-service |
-| `internal/` | Код сервисов: API, работа с базой и хранилищем |
+| `internal/` | Код сервисов: API, база, хранилище, Kafka, outbox |
 | `migrations/` | Таблицы в базе (накатываются при старте api-service) |
 | `docker-compose.yml` | Запуск всего локально |
 
@@ -135,7 +145,7 @@ curl.exe http://localhost:8080/readyz
 - [x] Архитектура и контракты
 - [x] Инфраструктура в docker-compose
 - [x] api-service: загрузка, просмотр, скачивание, удаление
-- [ ] Отправка задач в Kafka
+- [x] Отправка задач в Kafka (через outbox)
 - [ ] analyzer
 - [ ] worker
 - [ ] Метрики и Grafana

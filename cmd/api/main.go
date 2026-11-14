@@ -1,5 +1,5 @@
 // api-service: принимает фото, сохраняет файл в S3, запись — в Postgres,
-// и кладёт задачу на анализ в outbox (в Kafka её отправит шаг 4).
+// кладёт задачу на анализ в outbox, а фоновая горутина переносит её в Kafka.
 package main
 
 import (
@@ -14,6 +14,8 @@ import (
 
 	"github.com/marimirals/photo-analysis/internal/api"
 	"github.com/marimirals/photo-analysis/internal/config"
+	"github.com/marimirals/photo-analysis/internal/kafka"
+	"github.com/marimirals/photo-analysis/internal/outbox"
 	"github.com/marimirals/photo-analysis/internal/storage"
 	"github.com/marimirals/photo-analysis/internal/store"
 )
@@ -54,9 +56,24 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	producer, err := kafka.NewProducer(cfg.KafkaBrokers)
+	if err != nil {
+		return err
+	}
+	defer producer.Close()
+
+	// Фоновая отправка outbox → Kafka. Остановится вместе с ctx.
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		outbox.NewRelay(st, producer.SendOutbox, log).Run(ctx)
+	}()
+	// Перед закрытием базы и Kafka остановить relay и дождаться его.
+	defer func() { stop(); <-relayDone }()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.NewServer(st, s3, log, cfg.KafkaTopicUploaded, cfg.MaxUploadBytes).Routes(),
+		Handler:           api.NewServer(st, s3, producer.Ping, log, cfg.KafkaTopicUploaded, cfg.MaxUploadBytes).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

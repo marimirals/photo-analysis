@@ -37,12 +37,14 @@ type Server struct {
 	store          *store.Store
 	s3             *storage.S3
 	log            *slog.Logger
+	kafkaPing      func(context.Context) error
 	topicUploaded  string
 	maxUploadBytes int64
 }
 
-func NewServer(st *store.Store, s3 *storage.S3, log *slog.Logger, topicUploaded string, maxUploadBytes int64) *Server {
-	return &Server{store: st, s3: s3, log: log, topicUploaded: topicUploaded, maxUploadBytes: maxUploadBytes}
+func NewServer(st *store.Store, s3 *storage.S3, kafkaPing func(context.Context) error, log *slog.Logger,
+	topicUploaded string, maxUploadBytes int64) *Server {
+	return &Server{store: st, s3: s3, kafkaPing: kafkaPing, log: log, topicUploaded: topicUploaded, maxUploadBytes: maxUploadBytes}
 }
 
 // Routes собирает все маршруты. Шаблоны вида "POST /path/{id}" — встроенный роутер Go 1.22+.
@@ -238,7 +240,9 @@ func (s *Server) deletePhoto(w http.ResponseWriter, r *http.Request, userID, id 
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-	checks := map[string]string{"postgres": "ok", "s3": "ok"}
+	// Kafka в readyz не влияет на статус: без неё загрузка всё равно работает,
+	// задачи подождут в outbox. Показываем только для информации.
+	checks := map[string]string{"postgres": "ok", "s3": "ok", "kafka": "ok"}
 	status := http.StatusOK
 	if err := s.store.Ping(ctx); err != nil {
 		checks["postgres"] = err.Error()
@@ -247,6 +251,9 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	if err := s.s3.Ping(ctx); err != nil {
 		checks["s3"] = err.Error()
 		status = http.StatusServiceUnavailable
+	}
+	if err := s.kafkaPing(ctx); err != nil {
+		checks["kafka"] = err.Error()
 	}
 	writeJSON(w, status, checks)
 }

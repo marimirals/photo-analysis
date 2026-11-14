@@ -17,6 +17,7 @@ type Config struct {
 	S3Bucket    string
 	S3UseSSL    bool
 
+	KafkaBrokers       string
 	KafkaTopicUploaded string
 
 	MaxUploadBytes int64
@@ -33,6 +34,7 @@ func Load() Config {
 		S3Bucket:    env("S3_BUCKET", "photos"),
 		S3UseSSL:    env("S3_USE_SSL", "false") == "true",
 
+		KafkaBrokers:       env("KAFKA_BROKERS", "localhost:9092"),
 		KafkaTopicUploaded: env("KAFKA_TOPIC_UPLOADED", "photos.uploaded"),
 
 		MaxUploadBytes: int64(envInt("MAX_UPLOAD_MB", 20)) << 20,

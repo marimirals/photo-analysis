@@ -180,3 +180,87 @@ func (s *Store) DeletePhoto(ctx context.Context, userID, id string) (string, err
 	}
 	return key, err
 }
+
+// ---------- outbox ----------
+
+type OutboxRecord struct {
+	ID      int64
+	Topic   string
+	Key     string
+	Payload []byte
+}
+
+// RelayOutbox берёт пачку ещё не отправленных событий, передаёт их в send
+// и, если send прошёл без ошибки, помечает их отправленными.
+// FOR UPDATE SKIP LOCKED: если api-service запущен в нескольких копиях,
+// они не возьмут одни и те же события.
+// Возвращает, сколько событий отправлено.
+func (s *Store) RelayOutbox(ctx context.Context, limit int, send func(context.Context, []OutboxRecord) error) (int, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
+		SELECT id, topic, key, payload FROM outbox
+		WHERE sent_at IS NULL
+		ORDER BY id
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED`, limit)
+	if err != nil {
+		return 0, err
+	}
+	var batch []OutboxRecord
+	for rows.Next() {
+		var r OutboxRecord
+		if err := rows.Scan(&r.ID, &r.Topic, &r.Key, &r.Payload); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		batch = append(batch, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(batch) == 0 {
+		return 0, nil
+	}
+
+	if err := send(ctx, batch); err != nil {
+		return 0, fmt.Errorf("send to kafka: %w", err)
+	}
+
+	ids := make([]int64, len(batch))
+	for i, r := range batch {
+		ids[i] = r.ID
+	}
+	if _, err := tx.Exec(ctx, `UPDATE outbox SET sent_at = now() WHERE id = ANY($1)`, ids); err != nil {
+		return 0, err
+	}
+	// Если упадём здесь, события уйдут в Kafka ещё раз. Это нормально:
+	// worker обрабатывает повторы без вреда.
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return len(batch), nil
+}
+
+// CleanupOutbox удаляет давно отправленные события, чтобы таблица не росла.
+func (s *Store) CleanupOutbox(ctx context.Context, olderThan time.Duration) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM outbox WHERE sent_at IS NOT NULL AND sent_at < now() - make_interval(secs => $1)`,
+		olderThan.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// OutboxPending — сколько событий ждут отправки (для метрик и отладки).
+func (s *Store) OutboxPending(ctx context.Context) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE sent_at IS NULL`).Scan(&n)
+	return n, err
+}

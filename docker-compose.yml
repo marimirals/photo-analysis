@@ -13,7 +13,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-photo}
       POSTGRES_DB: ${POSTGRES_DB:-photo}
     ports:
-      - "5433:5432"
+      - "5433:5432"   # 5433 снаружи: 5432 на ноутбуке занят Postgres, установленным в Windows
     volumes:
       - pgdata:/var/lib/postgresql/data
       # Таблицы создаёт api-service при старте (миграции из папки migrations).
