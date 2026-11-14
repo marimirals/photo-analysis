@@ -1,0 +1,10 @@
+# Python 3.12 (на 3.13 тоже работает)
+grpcio>=1.66
+grpcio-tools>=1.66
+grpcio-health-checking>=1.66
+minio>=7.2
+numpy>=1.26
+# mediapipe сам ставит opencv-contrib-python, отдельно OpenCV не ставим,
+# иначе два пакета cv2 подерутся
+mediapipe==0.10.32
+pytest>=8

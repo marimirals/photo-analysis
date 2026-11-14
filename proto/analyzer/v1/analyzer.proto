@@ -2,10 +2,16 @@ syntax = "proto3";
 
 package analyzer.v1;
 
-option go_package = "photo-analysis/gen/analyzer/v1;analyzerv1";
+option go_package = "github.com/marimirals/photo-analysis/gen/analyzer/v1;analyzerv1";
 
 // Сервис анализа изображений («внешняя зависимость»).
-// Worker передаёт ссылку на объект в MinIO, analyzer сам скачивает файл.
+// Worker передаёт ссылку на файл в S3, analyzer сам скачивает его.
+//
+// Коды ошибок (worker решает по ним, повторять ли):
+//   INVALID_ARGUMENT — файл не картинка или пустые поля: повторять бесполезно;
+//   NOT_FOUND        — файла нет в хранилище: повторять бесполезно;
+//   UNAVAILABLE      — хранилище недоступно: можно повторить позже;
+//   INTERNAL         — что-то сломалось внутри: можно повторить.
 service Analyzer {
   rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
 }

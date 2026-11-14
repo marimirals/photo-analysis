@@ -18,3 +18,7 @@ Thumbs.db
 .env
 *.local
 data/
+# analyzer: сгенерированный код и результаты подбора порогов
+analyzer/gen/
+analyzer/calibration.csv
+.pytest_cache/
