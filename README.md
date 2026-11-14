@@ -70,13 +70,52 @@ docker compose ps
 
 Логины и пароли по умолчанию указаны в `docker-compose.yml`. Чтобы поменять, скопируй `.env.example` в `.env` и поправь.
 
+### Запустить api-service
+
+Пока он запускается прямо на ноутбуке, в Docker его упакуем позже.
+
+```powershell
+go mod tidy          # один раз: скачает библиотеки
+go run ./cmd/api
+```
+
+При старте сервис сам создаёт таблицы в базе и бакет в хранилище. Слушает порт 8080.
+
+### Попробовать
+
+В PowerShell пиши именно `curl.exe`: просто `curl` там означает другую команду.
+
+```powershell
+# загрузить фото
+curl.exe -F "file=@C:\Users\acer\Pictures\cat.jpg" -H "X-User-ID: masha" http://localhost:8080/api/v1/photos
+
+# список своих фото
+curl.exe -H "X-User-ID: masha" http://localhost:8080/api/v1/photos
+
+# одно фото (id возьми из ответа на загрузку)
+curl.exe -H "X-User-ID: masha" http://localhost:8080/api/v1/photos/ID
+
+# скачать файл обратно
+curl.exe -H "X-User-ID: masha" -o back.jpg http://localhost:8080/api/v1/photos/ID/file
+
+# удалить
+curl.exe -X DELETE -H "X-User-ID: masha" http://localhost:8080/api/v1/photos/ID
+
+# всё ли подключено
+curl.exe http://localhost:8080/readyz
+```
+
+`X-User-ID` — это вместо логина: просто имя пользователя в заголовке. Чужие фото по id не видны.
+
 ## Где что лежит
 
 | Путь | Что там |
 |---|---|
 | `api/openapi.yaml` | Описание REST API: какие запросы, что отвечают |
 | `proto/analyzer/v1/analyzer.proto` | Как worker разговаривает с analyzer (gRPC) |
-| `migrations/` | Таблицы в базе |
+| `cmd/api/` | Запуск api-service |
+| `internal/` | Код сервисов: API, работа с базой и хранилищем |
+| `migrations/` | Таблицы в базе (накатываются при старте api-service) |
 | `docker-compose.yml` | Запуск всего локально |
 
 ## Как проверяются фото (первая версия, пороги ещё подбираются)
@@ -95,7 +134,8 @@ docker compose ps
 
 - [x] Архитектура и контракты
 - [x] Инфраструктура в docker-compose
-- [ ] api-service
+- [x] api-service: загрузка, просмотр, скачивание, удаление
+- [ ] Отправка задач в Kafka
 - [ ] analyzer
 - [ ] worker
 - [ ] Метрики и Grafana

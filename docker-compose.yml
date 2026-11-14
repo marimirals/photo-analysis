@@ -13,12 +13,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-photo}
       POSTGRES_DB: ${POSTGRES_DB:-photo}
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # Пока таблицы создаёт сам Postgres при первом запуске (только если база пустая).
-      # На шаге 3 миграции будет накатывать api-service при старте.
-      - ./migrations/0001_init.up.sql:/docker-entrypoint-initdb.d/0001_init.sql:ro
+      # Таблицы создаёт api-service при старте (миграции из папки migrations).
     mem_limit: 256m
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-photo} -d ${POSTGRES_DB:-photo}"]
