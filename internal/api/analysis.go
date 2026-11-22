@@ -129,6 +129,7 @@ func (s *Server) reanalyzePhoto(w http.ResponseWriter, r *http.Request, userID, 
 	if s.handleStoreErr(w, r, err) {
 		return
 	}
+	photosReanalyzed.Inc()
 	s.log.InfoContext(r.Context(), "photo queued for reanalysis", "photo_id", id, "user_id", userID)
 	writeJSON(w, http.StatusAccepted, p)
 }
@@ -141,6 +142,7 @@ func (s *Server) reanalyzeFailed(w http.ResponseWriter, r *http.Request, userID 
 	if s.handleStoreErr(w, r, err) {
 		return
 	}
+	photosReanalyzed.Add(float64(n))
 	s.log.InfoContext(r.Context(), "failed photos queued for reanalysis", "user_id", userID, "count", n)
 	writeJSON(w, http.StatusAccepted, map[string]int{"queued": n})
 }

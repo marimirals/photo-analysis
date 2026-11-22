@@ -6,20 +6,25 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/marimirals/photo-analysis/internal/config"
+	"github.com/marimirals/photo-analysis/internal/logx"
 	"github.com/marimirals/photo-analysis/internal/store"
 	"github.com/marimirals/photo-analysis/internal/worker"
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", "worker")
+	log := logx.New(os.Stdout, "worker")
 	slog.SetDefault(log)
 	if err := run(log); err != nil {
 		log.Error("service stopped with error", "err", err)
@@ -60,6 +65,7 @@ func run(log *slog.Logger) error {
 
 	// Маленький HTTP-сервер для проб Kubernetes (а на шаге 7 — для метрик).
 	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.Handler())
 	mux.HandleFunc("GET /healthz", func(rw http.ResponseWriter, r *http.Request) { rw.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", func(rw http.ResponseWriter, r *http.Request) {
 		c, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -75,9 +81,15 @@ func run(log *slog.Logger) error {
 		rw.WriteHeader(code)
 		_ = json.NewEncoder(rw).Encode(checks)
 	})
-	srv := &http.Server{Addr: cfg.WorkerHTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	// Порт занимаем сразу: если он занят (например, где-то ещё работает старый worker),
+	// лучше остановиться с понятной ошибкой, чем работать без метрик и проб.
+	ln, err := net.Listen("tcp", cfg.WorkerHTTPAddr)
+	if err != nil {
+		return fmt.Errorf("listen %s (maybe another worker is running?): %w", cfg.WorkerHTTPAddr, err)
+	}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http server failed", "err", err)
 		}
 	}()

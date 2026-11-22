@@ -9,11 +9,9 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/marimirals/photo-analysis/internal/logx"
 )
-
-type ctxKey int
-
-const requestIDKey ctxKey = 0
 
 // requestID даёт каждому запросу id: берёт из заголовка X-Request-ID или придумывает.
 // Он попадает в логи и в ответы с ошибками — по нему удобно искать проблему.
@@ -26,14 +24,11 @@ func requestID(next http.Handler) http.Handler {
 			id = hex.EncodeToString(b)
 		}
 		w.Header().Set("X-Request-ID", id)
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey, id)))
+		next.ServeHTTP(w, r.WithContext(logx.WithRequestID(r.Context(), id)))
 	})
 }
 
-func getRequestID(ctx context.Context) string {
-	id, _ := ctx.Value(requestIDKey).(string)
-	return id
-}
+func getRequestID(ctx context.Context) string { return logx.RequestID(ctx) }
 
 type statusRecorder struct {
 	http.ResponseWriter
@@ -45,20 +40,23 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// logRequests пишет строку лога и метрики на каждый запрос.
 func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
-			return // пробы Kubernetes дёргают их постоянно, не засоряем лог
+		switch r.URL.Path {
+		case "/healthz", "/readyz", "/metrics":
+			return // их дёргают постоянно (Kubernetes, Prometheus), не засоряем ни лог, ни метрики
 		}
-		log.Info("http request",
+		elapsed := time.Since(start)
+		observeHTTP(r, rec.status, elapsed)
+		log.InfoContext(r.Context(), "http request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rec.status,
-			"duration_ms", time.Since(start).Milliseconds(),
-			"request_id", getRequestID(r.Context()),
+			"duration_ms", elapsed.Milliseconds(),
 		)
 	})
 }

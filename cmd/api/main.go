@@ -12,16 +12,19 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/marimirals/photo-analysis/internal/api"
 	"github.com/marimirals/photo-analysis/internal/config"
 	"github.com/marimirals/photo-analysis/internal/kafka"
+	"github.com/marimirals/photo-analysis/internal/logx"
 	"github.com/marimirals/photo-analysis/internal/outbox"
 	"github.com/marimirals/photo-analysis/internal/storage"
 	"github.com/marimirals/photo-analysis/internal/store"
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", "api")
+	log := logx.New(os.Stdout, "api")
 	slog.SetDefault(log)
 
 	if err := run(log); err != nil {
@@ -47,6 +50,8 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	defer st.Close()
+
+	prometheus.MustRegister(api.NewDBCollector(st, log))
 
 	s3, err := storage.NewS3(cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Bucket, cfg.S3UseSSL)
 	if err != nil {

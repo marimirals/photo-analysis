@@ -6,7 +6,21 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/marimirals/photo-analysis/internal/store"
+)
+
+var (
+	eventsSent = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "outbox_events_sent_total",
+		Help: "События, отправленные из outbox в Kafka.",
+	})
+	relayErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "outbox_relay_errors_total",
+		Help: "Неудачные попытки отправить пачку из outbox (обычно — Kafka недоступна).",
+	})
 )
 
 type Sender func(context.Context, []store.OutboxRecord) error
@@ -39,6 +53,7 @@ func (r *Relay) Run(ctx context.Context) {
 		case ctx.Err() != nil:
 			return
 		case err != nil:
+			relayErrors.Inc()
 			r.log.Warn("outbox relay failed, will retry", "err", err, "retry_in", backoff.String())
 			if !sleep(ctx, backoff) {
 				return
@@ -46,6 +61,7 @@ func (r *Relay) Run(ctx context.Context) {
 			backoff = min(backoff*2, 30*time.Second)
 			continue
 		case n > 0:
+			eventsSent.Add(float64(n))
 			r.log.Info("outbox events sent", "count", n)
 			backoff = r.interval
 			if n == r.batchSize {

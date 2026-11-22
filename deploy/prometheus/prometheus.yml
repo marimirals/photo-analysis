@@ -1,0 +1,19 @@
+# Сервисы пока запускаются прямо на ноутбуке (go run, python), а Prometheus — в Docker.
+# host.docker.internal — это адрес ноутбука изнутри контейнера.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: api
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+  - job_name: worker
+    static_configs:
+      - targets: ["host.docker.internal:8081"]
+  - job_name: analyzer
+    static_configs:
+      - targets: ["host.docker.internal:9102"]
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

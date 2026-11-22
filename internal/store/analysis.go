@@ -253,3 +253,22 @@ func (s *Store) ReanalyzeFailed(ctx context.Context, userID, topic string, makeE
 	}
 	return len(items), tx.Commit(ctx)
 }
+
+// CountByStatus — сколько фото в каждом статусе (для метрик).
+func (s *Store) CountByStatus(ctx context.Context) (map[string]int, error) {
+	rows, err := s.pool.Query(ctx, `SELECT status, count(*) FROM photos GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	res := map[string]int{}
+	for rows.Next() {
+		var st string
+		var n int
+		if err := rows.Scan(&st, &n); err != nil {
+			return nil, err
+		}
+		res[st] = n
+	}
+	return res, rows.Err()
+}

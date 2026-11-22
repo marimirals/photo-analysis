@@ -3,6 +3,7 @@ grpcio>=1.66
 grpcio-tools>=1.66
 grpcio-health-checking>=1.66
 minio>=7.2
+prometheus-client>=0.20
 numpy>=1.26
 # mediapipe сам ставит opencv-contrib-python, отдельно OpenCV не ставим,
 # иначе два пакета cv2 подерутся

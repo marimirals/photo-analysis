@@ -136,6 +136,16 @@ type uploadedEvent struct {
 // получилось, заканчивается статусом failed и сообщением в photos.failed.
 func (w *Worker) handle(ctx context.Context, r *kgo.Record) {
 	start := time.Now()
+	jobsInFlight.Inc()
+	defer jobsInFlight.Dec()
+	result := "failed"
+	defer func() {
+		if ctx.Err() != nil && result == "failed" {
+			return // остановка, а не настоящая ошибка — не считаем
+		}
+		jobsTotal.WithLabelValues(result).Inc()
+		jobDuration.Observe(time.Since(start).Seconds())
+	}()
 	var ev uploadedEvent
 	if err := json.Unmarshal(r.Value, &ev); err != nil || ev.PhotoID == "" || ev.ObjectKey == "" {
 		w.log.Error("bad message, sending to DLQ", "err", err, "offset", r.Offset, "partition", r.Partition)
@@ -147,6 +157,7 @@ func (w *Worker) handle(ctx context.Context, r *kgo.Record) {
 	p, err := w.store.GetPhotoByID(ctx, ev.PhotoID)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
+		result = "skipped"
 		log.Info("photo was deleted, skipping")
 		return
 	case err != nil:
@@ -154,6 +165,7 @@ func (w *Worker) handle(ctx context.Context, r *kgo.Record) {
 		w.fail(ctx, r, ev, log, "database error: "+err.Error(), 0)
 		return
 	case p.Status == "done":
+		result = "skipped"
 		log.Info("already analyzed, skipping") // повторная доставка
 		return
 	}
@@ -167,6 +179,7 @@ func (w *Worker) handle(ctx context.Context, r *kgo.Record) {
 		},
 		onWait: func(err error, attempt int, pause time.Duration, unavailable bool) {
 			if unavailable {
+				analyzerWaits.Inc()
 				log.Warn("analyzer unavailable, waiting", "err", err, "retry_in", pause.String())
 			} else {
 				log.Warn("analysis failed, will retry", "err", err, "attempt", attempt, "retry_in", pause.String())
@@ -209,6 +222,16 @@ func (w *Worker) handle(ctx context.Context, r *kgo.Record) {
 		log.Error("save analysis failed", "err", err)
 		w.fail(ctx, r, ev, log, "save failed: "+err.Error(), attempt)
 		return
+	}
+	result = "done"
+	duplicatesFound.Add(float64(len(dups)))
+	for reason, bad := range map[string]bool{
+		"blurry": a.IsBlurry, "eyes_closed": a.EyesClosedCount > 0,
+		"underexposed": a.IsUnderexposed, "overexposed": a.IsOverexposed,
+	} {
+		if bad {
+			badShots.WithLabelValues(reason).Inc()
+		}
 	}
 	log.Info("photo analyzed",
 		"duration_ms", time.Since(start).Milliseconds(),

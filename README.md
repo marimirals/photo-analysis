@@ -52,6 +52,18 @@ flowchart LR
 
 ## Как запустить
 
+**Коротко, в каком порядке всё включать** (например, после перезагрузки ноутбука):
+
+1. Открыть Docker Desktop и дождаться «Engine running».
+2. `docker compose up -d` в папке проекта: база, хранилище и Kafka.
+3. Analyzer: `cd analyzer`, `.venv\Scripts\Activate.ps1`, `python -m photoanalyzer.server`, дождаться `models loaded`.
+4. `go run ./cmd/api` — в отдельном окне.
+5. `go run ./cmd/worker` — в отдельном окне.
+
+Если api пишет `connection refused` на порт 5433, значит, не запущены контейнеры (шаги 1–2). Порядок 3–5 не строгий: worker дождётся analyzer'а сам.
+
+Подробнее о каждом шаге ниже.
+
 Нужен запущенный Docker Desktop.
 
 ```powershell

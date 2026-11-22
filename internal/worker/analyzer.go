@@ -34,7 +34,10 @@ func (c *AnalyzerClient) Close() error { return c.conn.Close() }
 func (c *AnalyzerClient) Analyze(ctx context.Context, photoID, bucket, key string) (*analyzerv1.AnalyzeResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	return c.client.Analyze(ctx, &analyzerv1.AnalyzeRequest{PhotoId: photoID, Bucket: bucket, ObjectKey: key})
+	start := time.Now()
+	resp, err := c.client.Analyze(ctx, &analyzerv1.AnalyzeRequest{PhotoId: photoID, Bucket: bucket, ObjectKey: key})
+	analyzerCalls.WithLabelValues(status.Code(err).String()).Observe(time.Since(start).Seconds())
+	return resp, err
 }
 
 // retryable — стоит ли повторять вызов после такой ошибки.

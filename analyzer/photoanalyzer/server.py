@@ -16,6 +16,7 @@ import grpc
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 from minio import Minio
 from minio.error import S3Error
+from prometheus_client import Counter, Histogram, start_http_server
 
 from photoanalyzer import VERSION
 from photoanalyzer.core import Analyzer, Thresholds
@@ -26,6 +27,24 @@ import analyzer_pb2  # noqa: E402
 import analyzer_pb2_grpc  # noqa: E402
 
 log = logging.getLogger("analyzer")
+
+# ---------- метрики (http://localhost:9102/metrics) ----------
+REQUESTS = Counter("analyzer_requests_total", "Запросы Analyze по коду ответа gRPC.", ["code"])
+DURATION = Histogram(
+    "analyzer_duration_seconds", "Время анализа одного фото (скачивание + анализ).",
+    buckets=(.05, .1, .25, .5, 1, 2, 5, 10, 30),
+)
+FETCH_DURATION = Histogram(
+    "analyzer_fetch_duration_seconds", "Время скачивания фото из хранилища.",
+    buckets=(.01, .025, .05, .1, .25, .5, 1, 2, 5),
+)
+FACES = Histogram("analyzer_faces", "Сколько лиц на фото.", buckets=(0, 1, 2, 3, 5, 8, 13, 20))
+
+
+def abort(context, code, msg):
+    """context.abort, но сначала посчитать ответ в метриках."""
+    REQUESTS.labels(code.name).inc()
+    context.abort(code, msg)
 
 
 class JsonFormatter(logging.Formatter):
@@ -63,33 +82,38 @@ class AnalyzerService(analyzer_pb2_grpc.AnalyzerServicer):
 
     def Analyze(self, request, context):
         if not request.bucket or not request.object_key:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "bucket and object_key are required")
+            abort(context, grpc.StatusCode.INVALID_ARGUMENT, "bucket and object_key are required")
 
         fields = {"photo_id": request.photo_id, "object_key": request.object_key}
         start = time.monotonic()
 
         try:
-            data = self._fetch(request.bucket, request.object_key)
+            with FETCH_DURATION.time():
+                data = self._fetch(request.bucket, request.object_key)
         except S3Error as e:
             if e.code in ("NoSuchKey", "NoSuchBucket"):
-                context.abort(grpc.StatusCode.NOT_FOUND, f"object not found: {request.object_key}")
+                abort(context, grpc.StatusCode.NOT_FOUND, f"object not found: {request.object_key}")
             log.warning("s3 error", extra={"fields": {**fields, "err": str(e)}})
-            context.abort(grpc.StatusCode.UNAVAILABLE, f"storage error: {e.code}")
+            abort(context, grpc.StatusCode.UNAVAILABLE, f"storage error: {e.code}")
         except Exception as e:  # сеть, таймаут и т.п.
             log.warning("s3 unavailable", extra={"fields": {**fields, "err": str(e)}})
-            context.abort(grpc.StatusCode.UNAVAILABLE, "storage is unavailable")
+            abort(context, grpc.StatusCode.UNAVAILABLE, "storage is unavailable")
 
         try:
             r = self.analyzer.analyze_bytes(data)
         except ValueError as e:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+            abort(context, grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception:
             log.exception("analysis failed", extra={"fields": fields})
-            context.abort(grpc.StatusCode.INTERNAL, "analysis failed")
+            abort(context, grpc.StatusCode.INTERNAL, "analysis failed")
 
+        elapsed = time.monotonic() - start
+        DURATION.observe(elapsed)
+        FACES.observe(r.faces_count)
+        REQUESTS.labels("OK").inc()
         log.info("analyzed", extra={"fields": {
             **fields,
-            "duration_ms": round((time.monotonic() - start) * 1000),
+            "duration_ms": round(elapsed * 1000),
             "blur_score": r.blur_score,
             "faces": r.faces_count,
             "eyes_closed": r.eyes_closed_count,
@@ -116,6 +140,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[handler])
 
     addr = env("ANALYZER_ADDR", "[::]:50051")
+    metrics_port = int(env("METRICS_PORT", "9102"))
     workers = int(env("ANALYZER_WORKERS", "2"))
 
     s3 = Minio(
@@ -150,11 +175,12 @@ def main() -> None:
     health_servicer = health.HealthServicer()
     health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
 
+    start_http_server(metrics_port)
     server.add_insecure_port(addr)
     server.start()
     for name in ("", "analyzer.v1.Analyzer"):
         health_servicer.set(name, health_pb2.HealthCheckResponse.SERVING)
-    log.info("listening", extra={"fields": {"addr": addr, "workers": workers, "version": VERSION}})
+    log.info("listening", extra={"fields": {"addr": addr, "metrics_port": metrics_port, "workers": workers, "version": VERSION}})
 
     def stop(signum, _frame):
         log.info("shutting down", extra={"fields": {"signal": signum}})

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	_ "golang.org/x/image/webp"
 
 	"github.com/marimirals/photo-analysis/internal/storage"
@@ -62,6 +63,7 @@ func (s *Server) Routes() http.Handler {
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.ready)
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	return requestID(logRequests(s.log, mux))
 }
@@ -150,6 +152,8 @@ func (s *Server) uploadPhoto(w http.ResponseWriter, r *http.Request, userID stri
 		return
 	}
 
+	photosUploaded.WithLabelValues(contentType).Inc()
+	photoUploadBytes.Observe(float64(p.SizeBytes))
 	s.log.InfoContext(ctx, "photo uploaded", "photo_id", photoID, "user_id", userID,
 		"size_bytes", p.SizeBytes, "content_type", contentType)
 	writeJSON(w, http.StatusAccepted, p)
