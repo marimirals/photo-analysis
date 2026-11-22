@@ -137,6 +137,43 @@ paths:
               schema: { $ref: '#/components/schemas/Photo' }
         '404': { $ref: '#/components/responses/Error' }
 
+  /photos/{id}/reanalyze:
+    parameters:
+      - $ref: '#/components/parameters/PhotoID'
+      - $ref: '#/components/parameters/UserID'
+    post:
+      tags: [photos]
+      summary: Отправить фото на анализ ещё раз
+      description: Только для фото в статусе done или failed. Результат прошлого анализа заменится новым.
+      responses:
+        '202':
+          description: Поставлено в очередь
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Photo' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409':
+          description: Фото уже в очереди или в работе
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /photos/reanalyze-failed:
+    parameters:
+      - $ref: '#/components/parameters/UserID'
+    post:
+      tags: [photos]
+      summary: Отправить на анализ все упавшие фото пользователя
+      responses:
+        '202':
+          description: Сколько фото поставлено в очередь
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queued: { type: integer, example: 3 }
+
   /healthz:
     servers: [{ url: http://localhost:8080 }]
     get:
@@ -221,6 +258,8 @@ components:
             duplicate_of:
               type: array
               items: { type: string, format: uuid }
+              description: Только в /photos/{id}/analysis; в списке не заполняется
+            has_duplicates: { type: boolean }
         is_bad_shot:
           type: boolean
           description: Смазано, или пересвет/недосвет, или у кого-то закрыты глаза

@@ -33,7 +33,7 @@ class Thresholds:
     blur: float = field(default_factory=lambda: _env_float("BLUR_THRESHOLD", 50.0))
     dark: float = field(default_factory=lambda: _env_float("DARK_THRESHOLD", 40.0))
     bright: float = field(default_factory=lambda: _env_float("BRIGHT_THRESHOLD", 215.0))
-    face_score: float = field(default_factory=lambda: _env_float("FACE_SCORE_THRESHOLD", 0.8))
+    face_score: float = field(default_factory=lambda: _env_float("FACE_SCORE_THRESHOLD", 0.6))
     eye_blink: float = field(default_factory=lambda: _env_float("EYE_BLINK_THRESHOLD", 0.5))
     # Лица меньше этого (в пикселях после уменьшения картинки) на глаза не проверяем: слишком мелко.
     min_face_for_eyes: float = field(default_factory=lambda: _env_float("MIN_FACE_FOR_EYES", 60.0))
@@ -135,6 +135,10 @@ class FaceAnalyzer:
     def __init__(self, thresholds: Thresholds):
         self.t = thresholds
         self._local = threading.local()
+        # Все созданные модели MediaPipe, чтобы закрыть их при остановке
+        # (иначе Python пытается закрыть их сам, когда уже поздно, и пишет ошибку).
+        self._landmarkers = []
+        self._lock = threading.Lock()
         if not YUNET_PATH.exists():
             raise FileNotFoundError(f"нет модели {YUNET_PATH}, запусти download_models.py")
         self.eyes_enabled = LANDMARKER_PATH.exists()
@@ -162,7 +166,24 @@ class FaceAnalyzer:
             )
             lm = vision.FaceLandmarker.create_from_options(opts)
             self._local.landmarker = lm
+            with self._lock:
+                self._landmarkers.append(lm)
         return lm
+
+    def warmup(self) -> None:
+        """Загружает модели в текущем потоке, чтобы первое фото не ждало загрузки."""
+        self._yunet()
+        if self.eyes_enabled:
+            self._landmarker()
+
+    def close(self) -> None:
+        with self._lock:
+            for lm in self._landmarkers:
+                try:
+                    lm.close()
+                except Exception:  # при остановке уже неважно
+                    pass
+            self._landmarkers.clear()
 
     def detect_faces(self, bgr: np.ndarray) -> np.ndarray:
         """Возвращает массив N×15 (x, y, w, h, 5 точек лица, уверенность)."""
@@ -219,6 +240,10 @@ class Analyzer:
     def __init__(self, thresholds: Thresholds | None = None, faces: bool = True):
         self.t = thresholds or Thresholds()
         self.faces = FaceAnalyzer(self.t) if faces else None
+
+    def close(self) -> None:
+        if self.faces is not None:
+            self.faces.close()
 
     def analyze_bytes(self, data: bytes) -> Result:
         return self.analyze(decode(data))

@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from concurrent import futures
 from pathlib import Path
@@ -127,7 +128,22 @@ def main() -> None:
     analyzer = Analyzer(thresholds)  # тут же проверяется, что модели на месте
     log.info("thresholds", extra={"fields": vars(thresholds)})
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=workers))
+    # Прогрев: в каждом потоке пула заранее загружаем модели (~10 с на поток),
+    # иначе первое фото с лицами в каждом потоке ждёт загрузки.
+    pool = futures.ThreadPoolExecutor(max_workers=workers)
+    if analyzer.faces is not None:
+        started = time.monotonic()
+        barrier = threading.Barrier(workers)
+
+        def warm():
+            analyzer.faces.warmup()
+            barrier.wait()  # держим поток, чтобы следующая задача досталась другому
+
+        for f in [pool.submit(warm) for _ in range(workers)]:
+            f.result()
+        log.info("models loaded", extra={"fields": {"threads": workers, "seconds": round(time.monotonic() - started, 1)}})
+
+    server = grpc.server(pool)
     analyzer_pb2_grpc.add_AnalyzerServicer_to_server(AnalyzerService(analyzer, s3), server)
 
     # Стандартная gRPC-проверка здоровья — её умеют дёргать пробы Kubernetes.
@@ -149,6 +165,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     server.wait_for_termination()
+    analyzer.close()  # закрываем модели, пока Python ещё не начал завершаться
+    log.info("stopped")
 
 
 if __name__ == "__main__":

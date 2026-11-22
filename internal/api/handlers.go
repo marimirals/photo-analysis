@@ -56,6 +56,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/photos/{id}", s.withUser(s.withPhotoID(s.getPhoto)))
 	mux.HandleFunc("DELETE /api/v1/photos/{id}", s.withUser(s.withPhotoID(s.deletePhoto)))
 	mux.HandleFunc("GET /api/v1/photos/{id}/file", s.withUser(s.withPhotoID(s.getPhotoFile)))
+	mux.HandleFunc("GET /api/v1/photos/{id}/analysis", s.withUser(s.withPhotoID(s.getAnalysis)))
+	mux.HandleFunc("POST /api/v1/photos/{id}/reanalyze", s.withUser(s.withPhotoID(s.reanalyzePhoto)))
+	mux.HandleFunc("POST /api/v1/photos/reanalyze-failed", s.withUser(s.reanalyzeFailed))
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.ready)
@@ -134,14 +137,7 @@ func (s *Server) uploadPhoto(w http.ResponseWriter, r *http.Request, userID stri
 		return
 	}
 
-	ev := store.UploadedEvent{
-		EventID:    newUUID(),
-		PhotoID:    photoID,
-		UserID:     userID,
-		Bucket:     s.s3.Bucket(),
-		ObjectKey:  p.ObjectKey,
-		UploadedAt: time.Now().UTC(),
-	}
+	ev := s.newUploadedEvent(photoID, userID, p.ObjectKey)
 	if err := s.store.CreatePhoto(ctx, p, s.topicUploaded, ev); err != nil {
 		s.log.ErrorContext(ctx, "save photo failed", "err", err, "photo_id", photoID)
 		// Подчищаем файл, чтобы не копились сироты. Контекст новый: запрос мог уже отмениться.
@@ -194,12 +190,26 @@ func (s *Server) listPhotos(w http.ResponseWriter, r *http.Request, userID strin
 		writeError(w, r, http.StatusBadRequest, "unknown status")
 		return
 	}
+	var err error
+	for name, dst := range map[string]**bool{"blurry": &f.Blurry, "bad_shot": &f.BadShot, "duplicates": &f.Duplicates} {
+		if *dst, err = parseBool(q.Get(name)); err != nil {
+			writeError(w, r, http.StatusBadRequest, name+" must be true or false")
+			return
+		}
+	}
 
-	photos, total, err := s.store.ListPhotos(r.Context(), userID, f)
+	rows, total, err := s.store.ListPhotos(r.Context(), userID, f)
 	if s.handleStoreErr(w, r, err) {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": photos, "total": total})
+	items := make([]photoListItem, len(rows))
+	for i, row := range rows {
+		items[i].Photo = row.Photo
+		if row.Analysis != nil {
+			items[i].Analysis = toAnalysisResponse(row.Analysis, nil, row.HasDuplicates)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": total})
 }
 
 func (s *Server) getPhotoFile(w http.ResponseWriter, r *http.Request, userID, id string) {

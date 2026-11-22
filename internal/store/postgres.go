@@ -78,11 +78,6 @@ func Migrate(databaseURL string) error {
 // CreatePhoto сохраняет фото и событие для Kafka одной транзакцией:
 // либо записано и то и другое, либо ничего.
 func (s *Store) CreatePhoto(ctx context.Context, p *Photo, topic string, ev UploadedEvent) error {
-	payload, err := json.Marshal(ev)
-	if err != nil {
-		return err
-	}
-
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -99,14 +94,23 @@ func (s *Store) CreatePhoto(ctx context.Context, p *Photo, topic string, ev Uplo
 		return fmt.Errorf("insert photo: %w", err)
 	}
 
-	_, err = tx.Exec(ctx,
-		`INSERT INTO outbox (topic, key, payload) VALUES ($1, $2, $3)`,
-		topic, ev.UserID, payload)
+	if err := insertOutbox(ctx, tx, topic, ev); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// insertOutbox кладёт событие в outbox внутри уже открытой транзакции.
+func insertOutbox(ctx context.Context, tx pgx.Tx, topic string, ev UploadedEvent) error {
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO outbox (topic, key, payload) VALUES ($1, $2, $3)`, topic, ev.UserID, payload)
 	if err != nil {
 		return fmt.Errorf("insert outbox: %w", err)
 	}
-
-	return tx.Commit(ctx)
+	return nil
 }
 
 const photoColumns = `id::text, user_id, filename, content_type, size_bytes, width, height,
@@ -133,40 +137,107 @@ func (s *Store) GetPhoto(ctx context.Context, userID, id string) (*Photo, error)
 }
 
 type ListFilter struct {
-	Status string // пусто — любой
-	Limit  int
-	Offset int
+	Status     string // пусто — любой
+	Blurry     *bool  // nil — не фильтровать
+	BadShot    *bool
+	Duplicates *bool // true — только фото, у которых есть дубликат
+	Limit      int
+	Offset     int
 }
 
-func (s *Store) ListPhotos(ctx context.Context, userID string, f ListFilter) ([]Photo, int, error) {
+// PhotoWithAnalysis — строка списка: фото и (если уже готов) результат анализа.
+type PhotoWithAnalysis struct {
+	Photo
+	Analysis      *Analysis
+	HasDuplicates bool
+}
+
+const listColumns = `p.id::text, p.user_id, p.filename, p.content_type, p.size_bytes, p.width, p.height,
+	p.object_key, p.status, p.error, p.created_at, p.updated_at,
+	a.blur_score, a.is_blurry, a.faces_count, a.eyes_closed_count, a.mean_brightness,
+	a.is_underexposed, a.is_overexposed, a.phash, a.is_bad_shot, a.analyzer_version, a.analyzed_at,
+	EXISTS (SELECT 1 FROM duplicates d WHERE d.photo_a = p.id OR d.photo_b = p.id)`
+
+// buildListQuery собирает SQL для списка фото. Вынесено отдельно, чтобы проверять тестом.
+// Фильтры собираются из кусков, значения передаются только через параметры $N.
+func buildListQuery(userID string, f ListFilter) (countSQL, listSQL string, countArgs, listArgs []any) {
+	where := "p.user_id = $1"
+	args := []any{userID}
+	add := func(cond string, v any) {
+		args = append(args, v)
+		where += fmt.Sprintf(" AND "+cond, len(args))
+	}
+	if f.Status != "" {
+		add("p.status = $%d", f.Status)
+	}
+	if f.Blurry != nil {
+		add("a.is_blurry = $%d", *f.Blurry)
+	}
+	if f.BadShot != nil {
+		add("a.is_bad_shot = $%d", *f.BadShot)
+	}
+	const hasDup = "EXISTS (SELECT 1 FROM duplicates d WHERE d.photo_a = p.id OR d.photo_b = p.id)"
+	if f.Duplicates != nil {
+		if *f.Duplicates {
+			where += " AND " + hasDup
+		} else {
+			where += " AND NOT " + hasDup
+		}
+	}
+	from := " FROM photos p LEFT JOIN analysis a ON a.photo_id = p.id WHERE " + where
+
+	countSQL = "SELECT count(*)" + from
+	countArgs = args
+	listArgs = append(append([]any{}, args...), f.Limit, f.Offset)
+	listSQL = "SELECT " + listColumns + from +
+		fmt.Sprintf(" ORDER BY p.created_at DESC LIMIT $%d OFFSET $%d", len(listArgs)-1, len(listArgs))
+	return
+}
+
+func (s *Store) ListPhotos(ctx context.Context, userID string, f ListFilter) ([]PhotoWithAnalysis, int, error) {
+	countSQL, listSQL, countArgs, listArgs := buildListQuery(userID, f)
+
 	var total int
-	err := s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM photos WHERE user_id = $1 AND ($2 = '' OR status = $2)`,
-		userID, f.Status).Scan(&total)
-	if err != nil {
+	if err := s.pool.QueryRow(ctx, countSQL, countArgs...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-
-	rows, err := s.pool.Query(ctx, `
-		SELECT `+photoColumns+` FROM photos
-		WHERE user_id = $1 AND ($2 = '' OR status = $2)
-		ORDER BY created_at DESC
-		LIMIT $3 OFFSET $4`,
-		userID, f.Status, f.Limit, f.Offset)
+	rows, err := s.pool.Query(ctx, listSQL, listArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer rows.Close()
 
-	photos := []Photo{}
+	items := []PhotoWithAnalysis{}
 	for rows.Next() {
-		p, err := scanPhoto(rows)
+		var it PhotoWithAnalysis
+		p := &it.Photo
+		// Колонки анализа могут быть NULL (фото ещё не обработано) — читаем в указатели.
+		var (
+			blur, bright            *float64
+			blurry, under, over, bs *bool
+			faces, closed           *int
+			phash                   *int64
+			ver                     *string
+			at                      *time.Time
+		)
+		err := rows.Scan(&p.ID, &p.UserID, &p.Filename, &p.ContentType, &p.SizeBytes, &p.Width, &p.Height,
+			&p.ObjectKey, &p.Status, &p.Error, &p.CreatedAt, &p.UpdatedAt,
+			&blur, &blurry, &faces, &closed, &bright, &under, &over, &phash, &bs, &ver, &at,
+			&it.HasDuplicates)
 		if err != nil {
 			return nil, 0, err
 		}
-		photos = append(photos, *p)
+		if blur != nil {
+			it.Analysis = &Analysis{
+				PhotoID: p.ID, BlurScore: *blur, IsBlurry: *blurry, FacesCount: *faces,
+				EyesClosedCount: *closed, MeanBrightness: *bright, IsUnderexposed: *under,
+				IsOverexposed: *over, Phash: uint64(*phash), IsBadShot: *bs,
+				AnalyzerVersion: *ver, AnalyzedAt: *at,
+			}
+		}
+		items = append(items, it)
 	}
-	return photos, total, rows.Err()
+	return items, total, rows.Err()
 }
 
 // DeletePhoto удаляет запись и возвращает ключ файла, чтобы удалить и его.

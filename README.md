@@ -117,6 +117,59 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-s
 
 Выход — Ctrl+C. Если Kafka выключить (`docker compose stop kafka`), загрузка фото всё равно работает: задачи копятся в таблице `outbox` и уходят, когда Kafka вернётся.
 
+### Запустить worker
+
+Worker забирает задачи из Kafka, отправляет фото в analyzer и сохраняет результат. Перед первым запуском сгенерируй Go-код для общения с analyzer: `go generate ./gen`. Нужны `protoc`, `protoc-gen-go` и `protoc-gen-go-grpc`. Сгенерированные файлы появятся в `gen/analyzer/v1`, их надо закоммитить.
+
+```powershell
+go generate ./gen
+go mod tidy
+go run ./cmd/worker
+```
+
+Worker должен работать одновременно с api-service и analyzer, у каждого своё окно. Порядок запуска не важен: если analyzer ещё не поднялся, worker повторит попытку.
+
+Сколько фото обрабатывать параллельно, задаёт `WORKER_CONCURRENCY` (по умолчанию 4). Фото одного пользователя всё равно обрабатываются строго по очереди: иначе два его снимка могли бы одновременно искать дубликаты друг у друга и не найти.
+
+Что бывает, если что-то пошло не так:
+
+- **Analyzer выключен или перезапускается.** Worker ждёт его и фото не бросает: пауза растёт 2 → 4 → 8 → 16 → 30 секунд и дальше держится на 30, пока analyzer не вернётся. В логе при этом строки `analyzer unavailable, waiting`.
+- **Analyzer упал на конкретном фото** (ошибка внутри, таймаут). Ещё две попытки через 2 и 4 секунды, потом статус `failed`.
+- **Файл битый или пропал из хранилища.** Повторять бесполезно, фото сразу получает `failed`.
+
+Упавшие задачи попадают в очередь `photos.failed` вместе с причиной:
+
+```powershell
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic photos.failed --from-beginning
+```
+
+### Проанализировать заново
+
+Если фото упало или поменялись пороги, его можно отправить на анализ ещё раз:
+
+```powershell
+curl.exe -X POST -H "X-User-ID: masha" http://localhost:8080/api/v1/photos/ID/reanalyze
+curl.exe -X POST -H "X-User-ID: masha" http://localhost:8080/api/v1/photos/reanalyze-failed
+```
+
+Первая команда для одного фото, вторая для всех упавших сразу (в ответе их число). Фото, которое уже стоит в очереди, второй раз не ставится, в ответ придёт `409`.
+
+### Посмотреть результат анализа
+
+```powershell
+curl.exe -H "X-User-ID: masha" http://localhost:8080/api/v1/photos/ID/analysis
+```
+
+Пока фото в очереди, ответ будет `202` со статусом. Когда анализ готов, придёт `200` с результатом: смазанность, лица, закрытые глаза, яркость, список дубликатов и причины, почему кадр неудачный.
+
+Список можно фильтровать:
+
+```powershell
+curl.exe -H "X-User-ID: masha" "http://localhost:8080/api/v1/photos?bad_shot=true"
+curl.exe -H "X-User-ID: masha" "http://localhost:8080/api/v1/photos?duplicates=true"
+curl.exe -H "X-User-ID: masha" "http://localhost:8080/api/v1/photos?blurry=true"
+```
+
 ### Запустить analyzer (анализ фото, Python)
 
 Нужен Python 3.12 (3.13 тоже подойдёт). Всё делается в папке `analyzer`:
@@ -155,7 +208,8 @@ python calibrate.py "C:\Users\acer\Pictures\test"
 | `api/openapi.yaml` | Описание REST API: какие запросы, что отвечают |
 | `proto/analyzer/v1/analyzer.proto` | Как worker разговаривает с analyzer (gRPC) |
 | `analyzer/` | Сервис анализа на Python |
-| `cmd/api/` | Запуск api-service |
+| `cmd/api/`, `cmd/worker/` | Запуск api-service и worker |
+| `gen/` | Go-код, сгенерированный из `analyzer.proto` |
 | `internal/` | Код сервисов: API, база, хранилище, Kafka, outbox |
 | `migrations/` | Таблицы в базе (накатываются при старте api-service) |
 | `docker-compose.yml` | Запуск всего локально |
@@ -166,8 +220,8 @@ python calibrate.py "C:\Users\acer\Pictures\test"
 
 | Что | Как | Когда «плохо» (пока) |
 |---|---|---|
-| Смазанность | насколько резкие перепады яркости (дисперсия лапласиана). Фото делится на 16 клеток, берётся самая резкая: так портрет с размытым фоном не считается смазанным | меньше 100 |
-| Лица | детектор YuNet из OpenCV | — |
+| Смазанность | насколько резкие перепады яркости (дисперсия лапласиана). Фото делится на 16 клеток, берётся самая резкая: так портрет с размытым фоном не считается смазанным | меньше 50 |
+| Лица | детектор YuNet из OpenCV, порог уверенности 0,6 (с 0,8 пропускал крупные, наклонённые и смазанные лица) | — |
 | Закрытые глаза | для каждого лица MediaPipe оценивает, насколько закрыт каждый глаз (0–1). Берём меньший из двух, чтобы подмигивание не считалось | 0,5 и больше |
 | Яркость | средняя яркость от 0 до 255 | меньше 40 или больше 215 |
 | Дубликаты | «отпечаток» картинки (перцептивный хеш, 64 бита). У копии, уменьшенной или пересжатой версии отпечаток почти такой же | отличаются не больше чем в 6 битах |
@@ -183,6 +237,6 @@ python calibrate.py "C:\Users\acer\Pictures\test"
 - [x] api-service: загрузка, просмотр, скачивание, удаление
 - [x] Отправка задач в Kafka (через outbox)
 - [x] analyzer (пороги ещё подбираются)
-- [ ] worker
+- [x] worker: очередь, повторы, дубликаты, результаты в API
 - [ ] Метрики и Grafana
 - [ ] Kubernetes
