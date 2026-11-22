@@ -1,27 +1,47 @@
 openapi: 3.0.3
 info:
   title: Photo Analysis API
-  version: 0.1.0
+  version: 1.0.0
   description: |
     Сервис анализа фотографий для облачного хранилища.
-    Загрузка фото → сохранение в объектное хранилище → задача в Kafka →
-    асинхронный анализ (смазанность, лица, дубликаты, неудачные кадры) → результат через API.
 
-    Пользователь передаётся заголовком `X-User-ID` (упрощение вместо авторизации).
+    Загружаешь фото, а сервис в фоне проверяет: не смазано ли, сколько лиц
+    и не закрыты ли глаза, не слишком ли тёмное или светлое, нет ли копии
+    среди твоих фото. Результат приходит не сразу: сначала фото в статусе
+    `pending`, через секунду-другую — `done`.
+
+    **Как попробовать здесь:** нажми **Authorize** и введи любое имя
+    пользователя (например, `masha`) — это заголовок `X-User-ID`, упрощённая
+    замена логину. Дальше у любого запроса: **Try it out** → **Execute**.
+    Под ответом Swagger показывает ту же команду для `curl`.
+
+    Типичный путь: `POST /photos` (загрузить) → `GET /photos/{id}/analysis`
+    (повторять, пока не придёт 200) → `GET /photos?bad_shot=true` (все
+    неудачные кадры).
+
 servers:
-  - url: http://localhost:8080/api/v1
+  - url: /api/v1
+
+security:
+  - UserID: []
 
 tags:
   - name: photos
+    description: Загрузка, просмотр и удаление фото
+  - name: analysis
+    description: Результаты анализа и повторный анализ
   - name: system
+    description: Служебное — проверки для Kubernetes и метрики
 
 paths:
   /photos:
     post:
       tags: [photos]
-      summary: Загрузить фотографию
-      parameters:
-        - $ref: '#/components/parameters/UserID'
+      summary: Загрузить фото
+      description: |
+        Принимает JPEG, PNG или WebP до 20 МБ. Тип определяется по содержимому
+        файла, а не по расширению. Отвечает сразу, не дожидаясь анализа:
+        статус будет `pending`.
       requestBody:
         required: true
         content:
@@ -33,33 +53,56 @@ paths:
                 file:
                   type: string
                   format: binary
-                  description: JPEG, PNG или WebP, не больше 20 МБ
       responses:
         '202':
-          description: Фото принято, анализ поставлен в очередь
+          description: Фото сохранено, анализ поставлен в очередь
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Photo' }
-        '400': { $ref: '#/components/responses/Error' }
-        '413': { $ref: '#/components/responses/Error' }
-        '415': { $ref: '#/components/responses/Error' }
+        '400':
+          description: Нет поля `file`, файл пустой или это не читаемая картинка; нет или неверный `X-User-ID`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: Файл больше 20 МБ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '415':
+          description: Не JPEG, PNG или WebP
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: Хранилище файлов недоступно
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
     get:
       tags: [photos]
-      summary: Список фотографий пользователя с фильтрами
+      summary: Список своих фото
+      description: |
+        Сначала новые. У каждого фото поле `analysis` — результат, если он
+        уже готов, иначе `null`. Фильтры можно сочетать: например,
+        `bad_shot=true&duplicates=true`. Фильтры по анализу (`blurry`,
+        `bad_shot`) показывают только уже проанализированные фото.
       parameters:
-        - $ref: '#/components/parameters/UserID'
         - name: status
           in: query
           schema: { $ref: '#/components/schemas/PhotoStatus' }
         - name: blurry
           in: query
+          description: true — только смазанные, false — только резкие
           schema: { type: boolean }
         - name: bad_shot
           in: query
+          description: true — только неудачные кадры (смаз, закрытые глаза, темно или пересвет)
           schema: { type: boolean }
         - name: duplicates
           in: query
-          description: true — только фото, у которых найден дубликат
+          description: true — только фото, у которых есть копия; false — только без копий
           schema: { type: boolean }
         - name: limit
           in: query
@@ -74,56 +117,72 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [items, total]
                 properties:
                   items:
                     type: array
                     items: { $ref: '#/components/schemas/PhotoWithAnalysis' }
-                  total: { type: integer }
+                  total:
+                    type: integer
+                    description: Сколько всего фото подходит под фильтры (без учёта limit/offset)
+        '400':
+          description: Неизвестный статус или фильтр не true/false
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /photos/{id}:
     parameters:
       - $ref: '#/components/parameters/PhotoID'
-      - $ref: '#/components/parameters/UserID'
     get:
       tags: [photos]
-      summary: Метаданные и статус фотографии
+      summary: Одно фото — метаданные и статус
       responses:
         '200':
           description: OK
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Photo' }
-        '404': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
     delete:
       tags: [photos]
-      summary: Удалить фотографию
+      summary: Удалить фото
+      description: Удаляет запись, результат анализа, пары дубликатов и сам файл.
       responses:
         '204': { description: Удалено }
-        '404': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /photos/{id}/file:
     parameters:
       - $ref: '#/components/parameters/PhotoID'
-      - $ref: '#/components/parameters/UserID'
     get:
       tags: [photos]
-      summary: Скачать исходный файл
+      summary: Скачать сам файл
       responses:
         '200':
-          description: Файл изображения
+          description: Файл в исходном формате
           content:
-            image/*:
-              schema: { type: string, format: binary }
-        '404': { $ref: '#/components/responses/Error' }
+            image/jpeg: { schema: { type: string, format: binary } }
+            image/png: { schema: { type: string, format: binary } }
+            image/webp: { schema: { type: string, format: binary } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502':
+          description: Хранилище файлов недоступно
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /photos/{id}/analysis:
     parameters:
       - $ref: '#/components/parameters/PhotoID'
-      - $ref: '#/components/parameters/UserID'
     get:
-      tags: [photos]
+      tags: [analysis]
       summary: Результат анализа
-      description: Пока статус pending или processing, возвращается 202 без результата.
+      description: |
+        Пока анализ не готов (`pending`, `processing`) или не удался
+        (`failed`), приходит 202 с самим фото — в нём видно статус и,
+        для `failed`, причину в поле `error`. Упавшее фото можно отправить
+        на анализ ещё раз через `POST /photos/{id}/reanalyze`.
       responses:
         '200':
           description: Анализ готов
@@ -131,27 +190,28 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Analysis' }
         '202':
-          description: Анализ ещё не готов
+          description: Анализа пока нет — смотри `status` и `error`
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Photo' }
-        '404': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /photos/{id}/reanalyze:
     parameters:
       - $ref: '#/components/parameters/PhotoID'
-      - $ref: '#/components/parameters/UserID'
     post:
-      tags: [photos]
-      summary: Отправить фото на анализ ещё раз
-      description: Только для фото в статусе done или failed. Результат прошлого анализа заменится новым.
+      tags: [analysis]
+      summary: Проанализировать фото ещё раз
+      description: |
+        Для фото в статусе `done` или `failed` — например, после ошибки или
+        после смены порогов. Старый результат заменится новым.
       responses:
         '202':
-          description: Поставлено в очередь
+          description: Поставлено в очередь, статус снова `pending`
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Photo' }
-        '404': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: Фото уже в очереди или в работе
           content:
@@ -159,110 +219,168 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
 
   /photos/reanalyze-failed:
-    parameters:
-      - $ref: '#/components/parameters/UserID'
     post:
-      tags: [photos]
-      summary: Отправить на анализ все упавшие фото пользователя
+      tags: [analysis]
+      summary: Проанализировать заново все упавшие фото
       responses:
         '202':
-          description: Сколько фото поставлено в очередь
+          description: Сколько фото поставлено в очередь (0 — упавших нет)
           content:
             application/json:
               schema:
                 type: object
+                required: [queued]
                 properties:
                   queued: { type: integer, example: 3 }
 
   /healthz:
-    servers: [{ url: http://localhost:8080 }]
+    servers: [{ url: / }]
     get:
       tags: [system]
-      summary: Liveness — процесс жив
+      summary: Процесс жив
+      description: Для liveness-пробы Kubernetes. Всегда 200, пока процесс отвечает.
+      security: []
       responses:
         '200': { description: OK }
+
   /readyz:
-    servers: [{ url: http://localhost:8080 }]
+    servers: [{ url: / }]
     get:
       tags: [system]
-      summary: Readiness — есть связь с Postgres, MinIO и Kafka
-      responses:
-        '200': { description: Готов }
-        '503': { description: Не готов }
-  /metrics:
-    servers: [{ url: http://localhost:8080 }]
-    get:
-      tags: [system]
-      summary: Метрики Prometheus
+      summary: Готов принимать запросы
+      description: |
+        Для readiness-пробы Kubernetes. Проверяет Postgres и хранилище файлов.
+        Kafka показывается, но на ответ не влияет: без неё загрузка работает,
+        задачи подождут в базе.
+      security: []
       responses:
         '200':
-          description: text/plain в формате Prometheus
+          description: Готов
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: База или хранилище недоступны
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+  /metrics:
+    servers: [{ url: / }]
+    get:
+      tags: [system]
+      summary: Метрики для Prometheus
+      security: []
+      responses:
+        '200':
+          description: Текст в формате Prometheus
+          content:
+            text/plain:
+              schema: { type: string }
 
 components:
-  parameters:
+  securitySchemes:
     UserID:
-      name: X-User-ID
+      type: apiKey
       in: header
-      required: true
-      schema: { type: string, example: user-1 }
+      name: X-User-ID
+      description: |
+        Имя пользователя: латинские буквы, цифры, `-` и `_`, до 64 символов.
+        Упрощение вместо настоящей авторизации — каждый видит только свои фото.
+
+  parameters:
     PhotoID:
       name: id
       in: path
       required: true
+      description: id фото из ответа на загрузку
       schema: { type: string, format: uuid }
+
+  responses:
+    NotFound:
+      description: Фото нет или оно чужое
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
 
   schemas:
     PhotoStatus:
       type: string
       enum: [pending, processing, done, failed]
+      description: |
+        `pending` — в очереди, `processing` — анализируется,
+        `done` — готово, `failed` — не удалось (причина в `error`).
 
     Photo:
       type: object
-      required: [id, status, created_at]
+      required: [id, filename, content_type, size_bytes, status, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         filename: { type: string, example: IMG_0042.jpg }
-        content_type: { type: string, example: image/jpeg }
+        content_type: { type: string, enum: [image/jpeg, image/png, image/webp] }
         size_bytes: { type: integer, example: 2483120 }
-        width: { type: integer, nullable: true }
-        height: { type: integer, nullable: true }
+        width: { type: integer, nullable: true, example: 4032 }
+        height: { type: integer, nullable: true, example: 3024 }
         status: { $ref: '#/components/schemas/PhotoStatus' }
-        error: { type: string, nullable: true, description: Причина, если status = failed }
+        error:
+          type: string
+          nullable: true
+          description: Причина, если `status` = `failed`
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
     Analysis:
       type: object
+      required: [photo_id, blur, faces, exposure, duplicate, is_bad_shot, bad_shot_reasons, analyzer_version, analyzed_at]
       properties:
         photo_id: { type: string, format: uuid }
         blur:
           type: object
+          required: [score, is_blurry]
           properties:
-            score: { type: number, description: Дисперсия лапласиана; меньше — сильнее размыто, example: 42.7 }
+            score:
+              type: number
+              description: Резкость (дисперсия лапласиана самой резкой части фото). Меньше 50 — смазано.
+              example: 346.03
             is_blurry: { type: boolean }
         faces:
           type: object
+          required: [count, eyes_closed_count]
           properties:
-            count: { type: integer, example: 3 }
-            eyes_closed_count: { type: integer, example: 1 }
+            count: { type: integer, example: 6 }
+            eyes_closed_count:
+              type: integer
+              description: У скольких людей закрыты глаза (лица меньше 60 px не проверяются)
+              example: 2
         exposure:
           type: object
+          required: [mean_brightness, is_underexposed, is_overexposed]
           properties:
-            mean_brightness: { type: number, description: 0–255 }
+            mean_brightness:
+              type: number
+              description: Средняя яркость, 0–255. Меньше 40 — темно, больше 215 — пересвет.
+              example: 155.46
             is_underexposed: { type: boolean }
             is_overexposed: { type: boolean }
         duplicate:
           type: object
+          required: [phash, has_duplicates]
           properties:
-            phash: { type: string, description: 64-битный перцептивный хеш, hex, example: 'c3a1f0e0b0989c8e' }
+            phash:
+              type: string
+              description: «Отпечаток» фото — 64-битный перцептивный хеш в hex
+              example: a0ab26d5963af1d4
             duplicate_of:
               type: array
               items: { type: string, format: uuid }
-              description: Только в /photos/{id}/analysis; в списке не заполняется
+              description: |
+                id твоих фото, которые почти совпадают с этим (отпечатки
+                отличаются не больше чем в 6 битах). Есть только в
+                `/photos/{id}/analysis`, в списке не заполняется.
             has_duplicates: { type: boolean }
         is_bad_shot:
           type: boolean
-          description: Смазано, или пересвет/недосвет, или у кого-то закрыты глаза
+          description: Смазано, или у кого-то закрыты глаза, или темно, или пересвет
         bad_shot_reasons:
           type: array
           items:
@@ -275,21 +393,26 @@ components:
       allOf:
         - $ref: '#/components/schemas/Photo'
         - type: object
+          required: [analysis]
           properties:
             analysis:
               allOf: [{ $ref: '#/components/schemas/Analysis' }]
               nullable: true
+              description: null, пока анализ не готов
+
+    Readiness:
+      type: object
+      properties:
+        postgres: { type: string, example: ok }
+        s3: { type: string, example: ok }
+        kafka: { type: string, example: ok }
 
     Error:
       type: object
       required: [error]
       properties:
-        error: { type: string, example: unsupported content type }
-        request_id: { type: string }
-
-  responses:
-    Error:
-      description: Ошибка
-      content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        error: { type: string, example: photo not found }
+        request_id:
+          type: string
+          description: Тот же id, что в логах сервиса — по нему легко найти, что случилось
+          example: 697fab46fec2b1cf

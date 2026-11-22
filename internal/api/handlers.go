@@ -64,6 +64,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.ready)
 	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.HandleFunc("GET /docs", serveDocs)
+	mux.HandleFunc("GET /openapi.yaml", serveOpenAPI)
+	mux.Handle("GET /{$}", http.RedirectHandler("/docs", http.StatusFound)) // корень → документация
 
 	return requestID(logRequests(s.log, mux))
 }
