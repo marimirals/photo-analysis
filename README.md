@@ -1,254 +1,180 @@
-# Photo Analysis
+# Photo Analysis Service
 
-Учебный аналог фото-раздела Облака Mail. Загружаешь фотографию, а сервис в фоне её проверяет:
+A backend service for a cloud photo storage. It accepts photos, stores them and analyzes them asynchronously. For each photo it reports:
 
-- не смазана ли она;
-- сколько на ней лиц и не закрыты ли у кого-нибудь глаза;
-- не слишком ли тёмная или пересвеченная;
-- нет ли у тебя уже такой же (дубликаты).
+- blur;
+- number of faces;
+- closed eyes;
+- under- and overexposure;
+- duplicates among the user's photos.
 
-Результаты потом можно получить через API.
+Case project for the VK internship program.
 
-## Как это устроено
+## Architecture
 
-```mermaid
-flowchart LR
-    C[Ты / curl] -->|загрузка| API[api-service]
-    API --> S3[(SeaweedFS<br/>файлы)]
-    API --> PG[(Postgres<br/>данные)]
-    API -->|задача| K{{Kafka}}
-    K --> W[worker]
-    W -->|«проанализируй»| AN[analyzer]
-    W -->|результат| PG
+```
+client ──HTTP──▶ api ──▶ PostgreSQL (photos, results, outbox)
+                  │  └─▶ S3 storage (SeaweedFS)
+                  ▼
+            outbox relay ──▶ Kafka (photos.uploaded)
+                                  │
+                                  ▼
+                               worker ──gRPC──▶ analyzer (Python) ──▶ S3
+                                  │
+                                  ├─▶ PostgreSQL (results, duplicates)
+                                  └─▶ Kafka (photos.failed, dead letter queue)
 ```
 
-Если коротко, путь фотографии такой.
+- **api** (Go) — REST API. Stores the file in S3 and writes the photo and an outbox event to PostgreSQL in one transaction.
+- **outbox relay** — moves events from PostgreSQL to Kafka, so an uploaded photo cannot lose its analysis task.
+- **worker** (Go) — Kafka consumer group. Calls the analyzer over gRPC, saves results idempotently, finds duplicates.
+- **analyzer** (Python) — gRPC service that downloads the photo from S3 and runs computer vision models.
 
-1. **api-service** принимает фото, кладёт файл в хранилище **SeaweedFS**, а запись о нём — в **Postgres** со статусом «ждёт обработки». Сразу отвечает тебе, не дожидаясь анализа.
-2. Он же ставит задачу в **Kafka**: «проверь фото с таким-то id». В задаче только id и путь к файлу, сама картинка через очередь не ходит.
-3. **worker** забирает задачи из Kafka (несколько штук параллельно) и просит **analyzer** проверить каждое фото.
-4. **analyzer** скачивает файл из хранилища, считает признаки и возвращает их. Это отдельный сервис на Python с OpenCV.
-5. worker ищет похожие фото этого пользователя, сохраняет всё в Postgres и ставит статус «готово».
+## Key decisions
 
-Зачем так сложно, а не всё в одном сервисе: загрузка остаётся быстрой, даже если анализ медленный. Если анализ упал, задача не теряется. А если фото много, можно просто запустить больше worker'ов.
+- **Transactional outbox** — no lost tasks between the database write and Kafka.
+- **At-least-once delivery + idempotent upsert.** Offsets are committed only after results are saved, so redelivered messages are safe.
+- **Kafka key = `user_id`.** One user's photos are processed in order, so duplicate detection does not race with itself.
+- **Retry policy by gRPC status code:**
+  - `UNAVAILABLE` — wait for the analyzer without spending attempts;
+  - `INTERNAL` — up to 3 attempts, then the dead letter queue;
+  - `INVALID_ARGUMENT` / `NOT_FOUND` — fail immediately.
+- **gRPC client-side load balancing** (`round_robin` + headless Service in Kubernetes). gRPC keeps one long-lived HTTP/2 connection, so a regular Service would send all requests to one analyzer pod.
 
-### Чтобы ничего не терялось
+## How photos are analyzed
 
-- **Задача не потеряется между базой и Kafka.** Запись о фото и задача сохраняются в базе одной транзакцией (паттерн outbox), а в Kafka задачу переносит отдельный фоновый процесс. Если Kafka на минуту ляжет, задачи дождутся её в базе.
-- **Повторная задача ничего не сломает.** Kafka иногда доставляет сообщение дважды. Результат записывается так, что второй раз просто перезапишет то же самое.
-- **Сломанные задачи не крутятся вечно.** Три попытки с паузой, потом фото получает статус «ошибка», а задача уходит в отдельную очередь `photos.failed`, где её можно разобрать вручную.
-
-## Что из чего сделано
-
-| Часть | На чём | Зачем |
+| Check | Method | Default threshold |
 |---|---|---|
-| api-service | Go | REST API для загрузки и получения результатов |
-| worker | Go | Разбирает очередь, параллельно на горутинах |
-| analyzer | Python, OpenCV | Сам анализ картинок |
-| Postgres | — | Фото, статусы, результаты |
-| SeaweedFS | — | Файлы. Работает по протоколу S3, как Amazon S3, только у себя. Взят вместо MinIO, потому что образы MinIO из России не скачиваются |
-| Kafka | — | Очередь задач |
-| Prometheus + Grafana | — | Графики: сколько загружено, обработано, сколько ошибок |
+| Blur | Variance of the Laplacian on a 4×4 grid, sharpest cell (portraits with blurred background are not flagged) | < 50 |
+| Faces | OpenCV YuNet face detector | score ≥ 0.6 |
+| Closed eyes | MediaPipe FaceLandmarker blendshapes (`eyeBlink`) on each face crop | ≥ 0.5 |
+| Exposure | Mean brightness | < 40 or > 215 |
+| Duplicates | 64-bit perceptual hash (DCT), Hamming distance | ≤ 6 |
 
-## Как запустить
+Thresholds were calibrated on a set of 41 photos and can be changed with environment variables.
 
-**Коротко, в каком порядке всё включать** (например, после перезагрузки ноутбука):
+## Tech stack
 
-1. Открыть Docker Desktop и дождаться «Engine running».
-2. `docker compose up -d` в папке проекта: база, хранилище и Kafka.
-3. Analyzer: `cd analyzer`, `.venv\Scripts\Activate.ps1`, `python -m photoanalyzer.server`, дождаться `models loaded`.
-4. `go run ./cmd/api` — в отдельном окне.
-5. `go run ./cmd/worker` — в отдельном окне.
+| Area | Technologies |
+|---|---|
+| Services | Go 1.24+ (`net/http`, `log/slog`), Python 3.12 |
+| Storage | PostgreSQL 17 (pgx, goose migrations), SeaweedFS (S3 API, minio-go) |
+| Messaging | Apache Kafka 4.1 (KRaft), franz-go |
+| RPC | gRPC, Protocol Buffers, gRPC health checking |
+| Computer vision | OpenCV (YuNet), MediaPipe FaceLandmarker, NumPy |
+| Observability | Structured JSON logs with request IDs, Prometheus, Grafana (provisioned dashboard) |
+| API docs | OpenAPI 3, Swagger UI |
+| Deployment | Docker (multi-stage, distroless), Kubernetes (kind, kustomize), Docker Compose |
 
-Если api пишет `connection refused` на порт 5433, значит, не запущены контейнеры (шаги 1–2). Порядок 3–5 не строгий: worker дождётся analyzer'а сам.
+## Run in Kubernetes (kind)
 
-Подробнее о каждом шаге ниже.
-
-Нужен запущенный Docker Desktop.
+Requirements: Docker, kind, kubectl, Go 1.24+, PowerShell.
 
 ```powershell
-docker compose up -d
-docker compose ps
+.\deploy\k8s\up.ps1
 ```
 
-Первый запуск скачивает образы, это несколько минут. Когда всё поднимется, у `postgres`, `seaweedfs` и `kafka` будет статус `healthy`, а `seaweedfs-init` и `kafka-init` отработают и завершатся (`exited (0)`, так и должно быть).
+The script creates a kind cluster, builds the three images, loads all images into the cluster and applies the manifests. The first run takes 10–20 minutes, mostly installing Python dependencies for the analyzer image.
 
-Что можно открыть:
+| URL | What |
+|---|---|
+| http://localhost:30080/docs | Swagger UI |
+| http://localhost:30300 | Grafana dashboard |
+| http://localhost:30090 | Prometheus |
 
-- **Файлы** — http://localhost:8888/buckets/ — там должна быть папка `photos` (это и есть бакет). Ключи доступа к S3 лежат в `deploy/seaweedfs/s3.json`.
-- **Kafka UI** (по желанию) — запусти `docker compose --profile ui up -d` и открой http://localhost:8090.
+Scale the worker:
 
-Остановить: `docker compose down`. Остановить и **стереть все данные**: `docker compose down -v`.
-
-Логины и пароли по умолчанию указаны в `docker-compose.yml`. Чтобы поменять, скопируй `.env.example` в `.env` и поправь.
-
-### Запустить api-service
-
-Пока он запускается прямо на ноутбуке, в Docker его упакуем позже.
-
-```powershell
-go mod tidy          # один раз: скачает библиотеки
-go run ./cmd/api
+```bash
+kubectl -n photo scale deployment worker --replicas=3
 ```
 
-При старте сервис сам создаёт таблицы в базе и бакет в хранилище. Слушает порт 8080.
+Stop: `.\deploy\k8s\down.ps1`; delete the cluster: `.\deploy\k8s\down.ps1 -Cluster`.
 
-### Попробовать
+## Run locally (Docker Compose)
 
-В PowerShell пиши именно `curl.exe`: просто `curl` там означает другую команду.
-
-```powershell
-# загрузить фото
-curl.exe -F "file=@C:\Users\acer\Pictures\cat.jpg" -H "X-User-ID: masha" http://localhost:8080/api/v1/photos
-
-# список своих фото
-curl.exe -H "X-User-ID: masha" http://localhost:8080/api/v1/photos
-
-# одно фото (id возьми из ответа на загрузку)
-curl.exe -H "X-User-ID: masha" http://localhost:8080/api/v1/photos/ID
-
-# скачать файл обратно
-curl.exe -H "X-User-ID: masha" -o back.jpg http://localhost:8080/api/v1/photos/ID/file
-
-# удалить
-curl.exe -X DELETE -H "X-User-ID: masha" http://localhost:8080/api/v1/photos/ID
-
-# всё ли подключено
-curl.exe http://localhost:8080/readyz
+```bash
+docker compose --profile grafana up -d     # PostgreSQL, SeaweedFS, Kafka, Prometheus, Grafana
 ```
 
-`X-User-ID` — это вместо логина: просто имя пользователя в заголовке. Чужие фото по id не видны.
+Analyzer:
 
-### Посмотреть, что задача ушла в Kafka
-
-После загрузки фото api-service в течение полсекунды отправляет задачу в Kafka. В его логе появится строка `outbox events sent`. Посмотреть сами сообщения:
-
-```powershell
-docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic photos.uploaded --from-beginning --property print.key=true
-```
-
-Выход — Ctrl+C. Если Kafka выключить (`docker compose stop kafka`), загрузка фото всё равно работает: задачи копятся в таблице `outbox` и уходят, когда Kafka вернётся.
-
-### Запустить worker
-
-Worker забирает задачи из Kafka, отправляет фото в analyzer и сохраняет результат. Перед первым запуском сгенерируй Go-код для общения с analyzer: `go generate ./gen`. Нужны `protoc`, `protoc-gen-go` и `protoc-gen-go-grpc`. Сгенерированные файлы появятся в `gen/analyzer/v1`, их надо закоммитить.
-
-```powershell
-go generate ./gen
-go mod tidy
-go run ./cmd/worker
-```
-
-Worker должен работать одновременно с api-service и analyzer, у каждого своё окно. Порядок запуска не важен: если analyzer ещё не поднялся, worker повторит попытку.
-
-Сколько фото обрабатывать параллельно, задаёт `WORKER_CONCURRENCY` (по умолчанию 4). Фото одного пользователя всё равно обрабатываются строго по очереди: иначе два его снимка могли бы одновременно искать дубликаты друг у друга и не найти.
-
-Что бывает, если что-то пошло не так:
-
-- **Analyzer выключен или перезапускается.** Worker ждёт его и фото не бросает: пауза растёт 2 → 4 → 8 → 16 → 30 секунд и дальше держится на 30, пока analyzer не вернётся. В логе при этом строки `analyzer unavailable, waiting`.
-- **Analyzer упал на конкретном фото** (ошибка внутри, таймаут). Ещё две попытки через 2 и 4 секунды, потом статус `failed`.
-- **Файл битый или пропал из хранилища.** Повторять бесполезно, фото сразу получает `failed`.
-
-Упавшие задачи попадают в очередь `photos.failed` вместе с причиной:
-
-```powershell
-docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic photos.failed --from-beginning
-```
-
-### Проанализировать заново
-
-Если фото упало или поменялись пороги, его можно отправить на анализ ещё раз:
-
-```powershell
-curl.exe -X POST -H "X-User-ID: masha" http://localhost:8080/api/v1/photos/ID/reanalyze
-curl.exe -X POST -H "X-User-ID: masha" http://localhost:8080/api/v1/photos/reanalyze-failed
-```
-
-Первая команда для одного фото, вторая для всех упавших сразу (в ответе их число). Фото, которое уже стоит в очереди, второй раз не ставится, в ответ придёт `409`.
-
-### Посмотреть результат анализа
-
-```powershell
-curl.exe -H "X-User-ID: masha" http://localhost:8080/api/v1/photos/ID/analysis
-```
-
-Пока фото в очереди, ответ будет `202` со статусом. Когда анализ готов, придёт `200` с результатом: смазанность, лица, закрытые глаза, яркость, список дубликатов и причины, почему кадр неудачный.
-
-Список можно фильтровать:
-
-```powershell
-curl.exe -H "X-User-ID: masha" "http://localhost:8080/api/v1/photos?bad_shot=true"
-curl.exe -H "X-User-ID: masha" "http://localhost:8080/api/v1/photos?duplicates=true"
-curl.exe -H "X-User-ID: masha" "http://localhost:8080/api/v1/photos?blurry=true"
-```
-
-### Запустить analyzer (анализ фото, Python)
-
-Нужен Python 3.12 (3.13 тоже подойдёт). Всё делается в папке `analyzer`:
-
-```powershell
+```bash
 cd analyzer
-python -m venv .venv
-.venv\Scripts\Activate.ps1
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python download_models.py   # один раз: две готовые модели, ~4 МБ
-python gen_proto.py         # код для gRPC из analyzer.proto
-python -m pytest            # тесты
+python download_models.py    # if analyzer/models is empty
+python gen_proto.py
 python -m photoanalyzer.server
 ```
 
-Если PowerShell не даёт запустить `Activate.ps1`, один раз выполни `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+API and worker, each in its own terminal:
 
-Проверить на уже загруженном фото (в другом окне, тоже с активированным `.venv`):
-
-```powershell
-python try_client.py masha/ID_ФОТО
+```bash
+go run ./cmd/api
+go run ./cmd/worker
 ```
 
-### Подобрать пороги на своих фото
-
-```powershell
-python calibrate.py "C:\Users\acer\Pictures\test"
-```
-
-Скрипт напечатает для каждого фото резкость, яркость, число лиц и оценки «насколько закрыты глаза» (0 — открыты, 1 — закрыты), а ещё пары похожих фото. Таблица сохранится в `calibration.csv`. Пороги меняются переменными окружения, например `$env:BLUR_THRESHOLD=80`.
-
-## Где что лежит
-
-| Путь | Что там |
+| URL | What |
 |---|---|
-| `api/openapi.yaml` | Описание REST API: какие запросы, что отвечают |
-| `proto/analyzer/v1/analyzer.proto` | Как worker разговаривает с analyzer (gRPC) |
-| `analyzer/` | Сервис анализа на Python |
-| `cmd/api/`, `cmd/worker/` | Запуск api-service и worker |
-| `gen/` | Go-код, сгенерированный из `analyzer.proto` |
-| `internal/` | Код сервисов: API, база, хранилище, Kafka, outbox |
-| `migrations/` | Таблицы в базе (накатываются при старте api-service) |
-| `docker-compose.yml` | Запуск всего локально |
+| http://localhost:8080/docs | Swagger UI |
+| http://localhost:3000 | Grafana |
+| http://localhost:9090 | Prometheus |
+| http://localhost:8888/buckets/ | Stored files |
 
-## Как проверяются фото
+Default settings are in `.env.example`.
 
-Все проверки делаются на уменьшенной копии фото, поэтому пороги не зависят от того, на какую камеру оно снято.
+## API
 
-| Что | Как | Когда «плохо» (пока) |
+All requests require the `X-User-ID` header (a simplification instead of authentication).
+
+| Method | Path | Description |
 |---|---|---|
-| Смазанность | насколько резкие перепады яркости (дисперсия лапласиана). Фото делится на 16 клеток, берётся самая резкая: так портрет с размытым фоном не считается смазанным | меньше 50 |
-| Лица | детектор YuNet из OpenCV, порог уверенности 0,6 (с 0,8 пропускал крупные, наклонённые и смазанные лица) | — |
-| Закрытые глаза | для каждого лица MediaPipe оценивает, насколько закрыт каждый глаз (0–1). Берём меньший из двух, чтобы подмигивание не считалось | 0,5 и больше |
-| Яркость | средняя яркость от 0 до 255 | меньше 40 или больше 215 |
-| Дубликаты | «отпечаток» картинки (перцептивный хеш, 64 бита). У копии, уменьшенной или пересжатой версии отпечаток почти такой же | отличаются не больше чем в 6 битах |
+| `POST` | `/api/v1/photos` | Upload a photo (multipart, field `file`; JPEG, PNG, WebP up to 20 MB) |
+| `GET` | `/api/v1/photos` | List photos; filters `status`, `blurry`, `bad_shot`, `duplicates`, pagination |
+| `GET` | `/api/v1/photos/{id}` | Photo metadata and status |
+| `GET` | `/api/v1/photos/{id}/file` | Download the original |
+| `GET` | `/api/v1/photos/{id}/analysis` | Analysis result (`202` while processing) |
+| `POST` | `/api/v1/photos/{id}/reanalyze` | Analyze again |
+| `POST` | `/api/v1/photos/reanalyze-failed` | Re-queue all failed photos |
+| `DELETE` | `/api/v1/photos/{id}` | Delete a photo |
+| `GET` | `/healthz`, `/readyz`, `/metrics` | Health checks and Prometheus metrics |
 
-Фото считается **неудачным кадром**, если оно смазано, слишком тёмное или светлое, или у кого-то закрыты глаза.
+Example:
 
-Глаза проверяются только у лиц покрупнее (от 60 пикселей): на мелких лицах в групповом фото оценка ненадёжна.
+```bash
+curl -X POST http://localhost:8080/api/v1/photos -H "X-User-ID: alice" -F "file=@photo.jpg"
+curl http://localhost:8080/api/v1/photos/<id>/analysis -H "X-User-ID: alice"
+```
 
-## Готовность
+```json
+{
+  "blur": { "score": 84.71, "is_blurry": false },
+  "faces": { "count": 2, "eyes_closed_count": 0 },
+  "exposure": { "mean_brightness": 91.07, "is_underexposed": false, "is_overexposed": false },
+  "duplicate": { "phash": "9ac9c266cc2ce53d", "has_duplicates": false },
+  "is_bad_shot": false,
+  "bad_shot_reasons": []
+}
+```
 
-- [x] Архитектура и контракты
-- [x] Инфраструктура в docker-compose
-- [x] api-service: загрузка, просмотр, скачивание, удаление
-- [x] Отправка задач в Kafka (через outbox)
-- [x] analyzer (пороги ещё подбираются)
-- [x] worker: очередь, повторы, дубликаты, результаты в API
-- [ ] Метрики и Grafana
-- [ ] Kubernetes
+## Project structure
+
+```
+cmd/api, cmd/worker      entry points
+internal/api             HTTP handlers, metrics, Swagger UI
+internal/store           PostgreSQL queries
+internal/outbox          outbox relay
+internal/worker          Kafka consumer, retries, gRPC client
+api/openapi.yaml         API specification
+proto/                   gRPC contract
+analyzer/                Python analyzer, tests, threshold calibration script
+migrations/              database schema
+deploy/                  Dockerfiles, Kubernetes manifests, Prometheus and Grafana configs
+```
+
+## Tests
+
+```bash
+go test ./...
+cd analyzer && python -m pytest
+```
