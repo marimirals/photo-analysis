@@ -22,7 +22,14 @@ type AnalyzerClient struct {
 
 func NewAnalyzerClient(addr string, timeout time.Duration) (*AnalyzerClient, error) {
 	// Соединение устанавливается лениво, при первом вызове, и само переподключается.
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	//
+	// round_robin: если addr — имя «headless»-сервиса Kubernetes, DNS вернёт адреса
+	// всех копий analyzer, и запросы пойдут по ним по очереди. Без этого gRPC
+	// держит одно соединение и все запросы уходят в одну копию.
+	conn, err := grpc.NewClient(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin": {}}]}`),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("analyzer client: %w", err)
 	}

@@ -1,0 +1,69 @@
+# SeaweedFS — хранилище файлов с протоколом S3 (вместо MinIO, см. журнал).
+# Бакет photos создаёт сам api-service при старте.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 2Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # диск ReadWriteOnce: старый под должен уйти раньше нового
+  selector:
+    matchLabels: { app: seaweedfs }
+  template:
+    metadata:
+      labels: { app: seaweedfs }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: seaweedfs
+          image: chrislusf/seaweedfs:latest
+          imagePullPolicy: IfNotPresent   # для :latest по умолчанию Always — а из Docker Hub не скачать
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.podIP }
+          args:
+            - server
+            - -dir=/data
+            - -ip=$(POD_IP)
+            - -ip.bind=0.0.0.0
+            - -master.volumeSizeLimitMB=1024
+            - -volume.max=0
+            - -filer
+            - -s3
+            - -s3.port=8333
+            - -s3.config=/etc/seaweedfs/s3.json
+          ports:
+            - { name: s3, containerPort: 8333 }
+          readinessProbe:
+            tcpSocket: { port: s3 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: s3-config, mountPath: /etc/seaweedfs, readOnly: true }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: seaweedfs-data }
+        - name: s3-config
+          configMap: { name: seaweedfs-s3 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs
+spec:
+  selector: { app: seaweedfs }
+  ports:
+    - { name: s3, port: 8333, targetPort: s3 }

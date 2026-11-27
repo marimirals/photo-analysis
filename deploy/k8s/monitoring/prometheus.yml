@@ -1,0 +1,26 @@
+# Prometheus внутри Kubernetes. Адреса — имена сервисов в namespace photo.
+# Для worker и analyzer — dns_sd по headless-сервисам: DNS возвращает адреса
+# всех копий, и метрики собираются с каждой отдельно.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: api
+    static_configs:
+      - targets: ["api:8080"]
+  - job_name: worker
+    dns_sd_configs:
+      - names: ["worker.photo.svc.cluster.local"]
+        type: A
+        port: 8081
+        refresh_interval: 15s
+  - job_name: analyzer
+    dns_sd_configs:
+      - names: ["analyzer.photo.svc.cluster.local"]
+        type: A
+        port: 9102
+        refresh_interval: 15s
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

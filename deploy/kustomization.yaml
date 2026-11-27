@@ -1,0 +1,37 @@
+# Всё приложение в Kubernetes одной командой:
+#   kubectl apply -k deploy
+# (лежит в deploy/, а не в deploy/k8s/, чтобы дотянуться до общих файлов
+#  Grafana и SeaweedFS — kustomize не читает файлы выше своей папки)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: photo
+
+resources:
+  - k8s/namespace.yaml
+  - k8s/config.yaml
+  - k8s/infra/postgres.yaml
+  - k8s/infra/seaweedfs.yaml
+  - k8s/infra/kafka.yaml
+  - k8s/app/analyzer.yaml
+  - k8s/app/api.yaml
+  - k8s/app/worker.yaml
+  - k8s/monitoring/prometheus.yaml
+  - k8s/monitoring/grafana.yaml
+
+# ConfigMap'ы из файлов. К имени добавляется хеш содержимого: если файл
+# поменялся, поды, которые его используют, перезапустятся сами.
+configMapGenerator:
+  - name: seaweedfs-s3
+    files: [seaweedfs/s3.json]
+  - name: prometheus-config
+    files: [k8s/monitoring/prometheus.yml]
+  - name: grafana-datasources
+    files: [prometheus.yml=k8s/monitoring/grafana-datasource.yml]
+  - name: grafana-dashboard-provider
+    files: [grafana/provisioning/dashboards/dashboards.yml]
+  - name: grafana-dashboards
+    files: [grafana/dashboards/photo-analysis.json]
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: photo-analysis

@@ -1,0 +1,18 @@
+# Локальный кластер Kubernetes из одного узла (внутри Docker).
+#   kind create cluster --config deploy/k8s/kind-config.yaml
+#
+# extraPortMappings пробрасывают порты узла на ноутбук, поэтому сервисы
+# типа NodePort открываются прямо в браузере:
+#   http://localhost:30080/docs  — api-service (Swagger UI)
+#   http://localhost:30300       — Grafana
+#   http://localhost:30090       — Prometheus
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: photo
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.33.1   # уже скачан на ноутбук; другие версии из Docker Hub не скачать
+    extraPortMappings:
+      - { containerPort: 30080, hostPort: 30080, listenAddress: "127.0.0.1" }
+      - { containerPort: 30300, hostPort: 30300, listenAddress: "127.0.0.1" }
+      - { containerPort: 30090, hostPort: 30090, listenAddress: "127.0.0.1" }

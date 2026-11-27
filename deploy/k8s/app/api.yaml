@@ -1,0 +1,53 @@
+# api-service. Одна копия: при старте он накатывает миграции, а goose
+# без блокировки не рассчитан на одновременный запуск из нескольких копий.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: api
+          image: photo-api:dev
+          imagePullPolicy: Never   # образ собран на ноутбуке и загружен в kind
+          envFrom:
+            - configMapRef: { name: app-config }
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: app-secrets, key: DATABASE_URL } }
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: app-secrets, key: S3_ACCESS_KEY } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: app-secrets, key: S3_SECRET_KEY } }
+          ports:
+            - { name: http, containerPort: 8080 }
+          # Жив ли процесс. Если нет — Kubernetes перезапустит контейнер.
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          # Готов ли принимать запросы (база и хранилище доступны).
+          # Пока нет — трафик на этот под не идёт, но и перезапуска нет.
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  type: NodePort
+  selector: { app: api }
+  ports:
+    - { name: http, port: 8080, targetPort: http, nodePort: 30080 }

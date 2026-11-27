@@ -1,0 +1,26 @@
+# Общие настройки сервисов. Секреты отдельно, в app-secrets.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  S3_ENDPOINT: "seaweedfs:8333"
+  S3_BUCKET: "photos"
+  KAFKA_BROKERS: "kafka:9092"
+  KAFKA_TOPIC_UPLOADED: "photos.uploaded"
+  KAFKA_TOPIC_FAILED: "photos.failed"
+---
+# Для учебного стенда пароли лежат прямо здесь. В настоящем проекте их
+# не коммитят: создают командой kubectl create secret или берут из Vault.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+type: Opaque
+stringData:
+  POSTGRES_USER: "photo"
+  POSTGRES_PASSWORD: "photo"
+  POSTGRES_DB: "photo"
+  DATABASE_URL: "postgres://photo:photo@postgres:5432/photo?sslmode=disable"
+  S3_ACCESS_KEY: "photo"
+  S3_SECRET_KEY: "photo12345"

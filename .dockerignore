@@ -1,0 +1,12 @@
+# Что не отправлять в Docker при сборке образов: лишнее, тяжёлое или секретное.
+.git
+.idea
+.vscode
+.env
+*.local
+data/
+**/__pycache__
+**/.pytest_cache
+analyzer/.venv
+analyzer/gen
+analyzer/calibration*.csv

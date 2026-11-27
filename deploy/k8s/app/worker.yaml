@@ -1,0 +1,56 @@
+# worker. Две копии — чтобы было видно масштабирование: Kafka поделит между
+# ними 3 партиции топика photos.uploaded. Больше 3 копий смысла нет — лишние
+# будут простаивать без партиций.
+#   kubectl -n photo scale deployment worker --replicas=3
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: worker }
+  template:
+    metadata:
+      labels: { app: worker }
+    spec:
+      enableServiceLinks: false
+      # Время доделать начатое при остановке. Неотмеченные в Kafka задачи
+      # не пропадут — их заберёт другая копия.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: photo-worker:dev
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef: { name: app-config }
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: app-secrets, key: DATABASE_URL } }
+            # Headless-сервис analyzer: DNS вернёт адреса всех его копий,
+            # а gRPC-клиент раскидает запросы по ним (round_robin).
+            - { name: ANALYZER_ADDR, value: "analyzer:50051" }
+            - { name: WORKER_CONCURRENCY, value: "4" }
+          ports:
+            - { name: http, containerPort: 8081 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 48Mi }
+            limits: { memory: 192Mi }
+---
+# Headless (без общего IP): нужен Prometheus, чтобы собирать метрики
+# с каждой копии worker отдельно.
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker
+spec:
+  clusterIP: None
+  selector: { app: worker }
+  ports:
+    - { name: http, port: 8081, targetPort: http }
